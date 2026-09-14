@@ -422,13 +422,13 @@ async fn reconcile_confirmed_stopped_machine(
         })
 }
 
-/// Attempt graceful shutdown, then force-terminate if still running.
+/// Stop after confirmed guest quiescence, or discard an explicitly deleted VM.
 ///
 /// Uses verified signals to prevent killing an unrelated process if the
 /// PID was recycled by the OS. Returns true if the process is confirmed
 /// dead (or was never running), false if it may still be alive.
-/// `graceful`: when true (stop), give the guest a SIGTERM grace period to flush
-/// to its persistent overlay before SIGKILL. When false (delete), the machine's
+/// `graceful`: when true (stop), require a safe shutdown acknowledgment before
+/// sending any termination signal. When false (delete), the machine's
 /// disks are discarded immediately after, so there is nothing to flush — SIGKILL
 /// at once instead of waiting out the guest's graceful shutdown (the bulk of the
 /// ~1.9s DELETE latency on metal).
@@ -441,12 +441,22 @@ fn shutdown_machine_process(
     // Try graceful shutdown via vsock first.
     // If vsock connects, this confirms the process is our VM (identity verification).
     let manager = AgentManager::for_vm(name).ok();
-    let mut vsock_confirmed = false;
-    if let Some(ref manager) = manager {
+    let mut shutdown_acknowledged = false;
+    if let Some(manager) = manager.as_ref().filter(|_| graceful) {
         if let Ok(mut client) = AgentClient::connect(manager.vsock_socket()) {
-            vsock_confirmed = true;
-            let _ = client.shutdown();
+            shutdown_acknowledged = client.shutdown().is_ok();
         }
+    }
+
+    if graceful && !shutdown_acknowledged {
+        if pid.is_some_and(|pid| !is_alive(pid)) {
+            return true;
+        }
+        tracing::warn!(
+            name,
+            "guest shutdown was not acknowledged; preserving the live VM and its disks"
+        );
+        return false;
     }
 
     // PID-based signal handling.
@@ -455,7 +465,7 @@ fn shutdown_machine_process(
         // We intentionally do NOT use the lenient is_our_process() here because
         // it treats any alive PID as "ours" when start_time is None — which risks
         // killing an unrelated process if the OS reused the PID.
-        let identity_ok = vsock_confirmed || is_our_process_strict(pid, pid_start_time);
+        let identity_ok = shutdown_acknowledged || is_our_process_strict(pid, pid_start_time);
 
         if identity_ok {
             // On delete the disks are removed right after, so skip the SIGTERM
@@ -2623,8 +2633,8 @@ pub async fn stop_machine(
             match e.manager.stop() {
                 Ok(()) => true,
                 Err(err) => {
-                    tracing::warn!(name = %name_clone, error = %err, "manager.stop() failed, falling back to process kill");
-                    shutdown_machine_process(&name_clone, pid, pid_start_time, true)
+                    tracing::warn!(name = %name_clone, error = %err, "graceful stop failed; preserving the live VM for retry");
+                    false
                 }
             }
         } else {
@@ -2713,8 +2723,11 @@ pub async fn sync_machine(
 /// gated, and the loopback door is localhost.
 pub async fn drain_node(State(state): State<Arc<ApiState>>) -> axum::http::StatusCode {
     tracing::info!("drain requested via API (node decommission)");
-    drain_machines(&state).await;
-    axum::http::StatusCode::OK
+    if drain_machines(&state).await {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 /// Gracefully stop every running VM. Two callers: the opt-in shutdown path
@@ -2723,7 +2736,7 @@ pub async fn drain_node(State(state): State<Arc<ApiState>>) -> axum::http::Statu
 /// Draining stops VMs cleanly — flushing disk state and marking them stopped so
 /// the control plane can reschedule. Best-effort, concurrent, and bounded so it
 /// fits inside the host's termination grace period.
-pub async fn drain_machines(state: &Arc<ApiState>) {
+pub async fn drain_machines(state: &Arc<ApiState>) -> bool {
     let running: Vec<(String, VmRecord)> = match state.list_vm_records().await {
         Ok(vms) => vms
             .into_iter()
@@ -2731,11 +2744,11 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
             .collect(),
         Err(e) => {
             tracing::error!(error = ?e, "drain: failed to list machines");
-            return;
+            return false;
         }
     };
     if running.is_empty() {
-        return;
+        return true;
     }
     tracing::info!(
         count = running.len(),
@@ -2766,19 +2779,14 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
                         return false;
                     }
                 }
-                // Prefer the registered manager (holds the flock); fall back to a
-                // PID-verified signal — same path as the stop handler.
-                let via_manager = entry
-                    .as_ref()
-                    .map(|e| e.lock().manager.stop().is_ok())
-                    .unwrap_or(false);
-                via_manager
-                    || shutdown_machine_process(
+                // Both paths require guest quiescence before verified signals.
+                entry.as_ref().map(|e| e.lock().manager.stop().is_ok()).unwrap_or_else(||
+                    shutdown_machine_process(
                         &name_for_kill,
                         record.pid,
                         record.pid_start_time,
                         true,
-                    )
+                    ))
             })
             .await
             .unwrap_or(false);
@@ -2799,20 +2807,24 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
                     })
                     .await;
             }
-            tracing::info!(machine = %name, stopped, "drain: machine stopped");
+            tracing::info!(machine = %name, stopped, "drain: shutdown attempt finished");
+            stopped
         }));
     }
 
     let drain_all = async {
+        let mut complete = true;
         for h in handles {
-            let _ = h.await;
+            complete &= h.await.unwrap_or(false);
         }
+        complete
     };
-    if tokio::time::timeout(std::time::Duration::from_secs(25), drain_all)
-        .await
-        .is_err()
-    {
-        tracing::warn!("drain: deadline reached before all machines stopped");
+    match tokio::time::timeout(std::time::Duration::from_secs(130), drain_all).await {
+        Ok(complete) => complete,
+        Err(_) => {
+            tracing::warn!("drain: deadline reached before all machines stopped");
+            false
+        }
     }
 }
 

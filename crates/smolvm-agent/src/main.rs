@@ -19,6 +19,8 @@ use std::sync::OnceLock;
 use tracing::{debug, error, info, warn};
 
 mod crun;
+mod shutdown;
+mod shutdown_freeze;
 
 /// Ensures storage disk is mounted exactly once. The mount happens either during
 /// deferred init (the common case) or on the first request that needs storage
@@ -1462,78 +1464,8 @@ fn setup_persistent_rootfs() {
     // No-op on non-Linux platforms
 }
 
-/// Sync filesystem caches before shutdown.
-/// This prevents ext4 corruption when the VM is terminated.
-#[cfg(target_os = "linux")]
-fn sync_and_unmount_storage() {
-    info!("syncing filesystems before shutdown");
-
-    // Sync all filesystem caches to disk
-    // SAFETY: sync() is always safe to call
-    unsafe {
-        libc::sync();
-    }
-
-    // Flushing is not enough on its own: ext4 clears its recovery flag only
-    // when the filesystem is taken read-only or unmounted, so a machine that
-    // was merely synced leaves a journal for the next boot to replay. Replaying
-    // one that still holds metadata for recent writes can leave the image
-    // manifest unreadable, and the machine then starts with "image not found"
-    // even though nothing was lost.
-    //
-    // /storage cannot be unmounted -- the overlay sits on top of it -- but a
-    // read-only remount checkpoints the journal just the same and leaves the
-    // filesystem clean for the next mount.
-    remount_storage_read_only();
-}
-
-/// Takes /storage read-only so ext4 checkpoints its journal.
-#[cfg(target_os = "linux")]
-fn remount_storage_read_only() {
-    let Ok(target) = std::ffi::CString::new(paths::STORAGE_ROOT) else {
-        return;
-    };
-
-    // SAFETY: a remount needs only the target path; the source, filesystem type
-    // and options are unused and may be null.
-    let ret = unsafe {
-        libc::mount(
-            std::ptr::null(),
-            target.as_ptr(),
-            std::ptr::null(),
-            libc::MS_REMOUNT | libc::MS_RDONLY,
-            std::ptr::null(),
-        )
-    };
-
-    if ret == 0 {
-        info!(
-            "remounted {} read-only; journal checkpointed",
-            paths::STORAGE_ROOT
-        );
-    } else {
-        // Something still holds it writable. The sync above already flushed the
-        // data, so the next boot replays the journal as it did before.
-        warn!(
-            "could not remount {} read-only: {}; the next boot will replay the journal instead",
-            paths::STORAGE_ROOT,
-            std::io::Error::last_os_error()
-        );
-    }
-}
-
-/// Stub for non-Linux platforms.
-#[cfg(not(target_os = "linux"))]
-fn remount_storage_read_only() {}
-
-/// Stub for non-Linux platforms.
-#[cfg(not(target_os = "linux"))]
-fn sync_and_unmount_storage() {
-    // No-op on non-Linux platforms
-}
-
 /// Set up signal handlers to sync filesystem on SIGTERM/SIGINT.
-/// This prevents ext4 corruption when the VM is forcefully stopped.
+/// Best effort only; graceful host shutdown requires confirmed quiescence.
 #[cfg(target_os = "linux")]
 fn setup_signal_handlers() {
     // SAFETY: Signal handler that calls sync() - sync is async-signal-safe
@@ -2191,6 +2123,19 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        if let AgentRequest::Shutdown { progress } = request {
+            shutdown::respond(stream, progress, || {
+                // Serialize shutdown requests without blocking progress for a
+                // second caller waiting for the first flush to finish.
+                static FLUSH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+                let _guard = FLUSH
+                    .lock()
+                    .map_err(|_| std::io::Error::other("storage synchronization lock poisoned"))?;
+                shutdown_freeze::freeze_internal_filesystems()
+            })?;
+            return Ok(());
+        }
+
         // Check if this is an interactive run request
         if let AgentRequest::Run {
             interactive: true, ..
@@ -2358,7 +2303,7 @@ fn handle_request(
         AgentRequest::Ping
         | AgentRequest::NetworkTest { .. }
         | AgentRequest::VmExec { .. }
-        | AgentRequest::Shutdown => {}
+        | AgentRequest::Shutdown { .. } => {}
         _ => {
             ensure_storage_mounted();
         }
@@ -2366,8 +2311,10 @@ fn handle_request(
 
     match request {
         AgentRequest::Ping => {
-            let capabilities =
-                vec![smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string()];
+            let capabilities = vec![
+                smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string(),
+                smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.to_string(),
+            ];
             AgentResponse::Pong {
                 version: PROTOCOL_VERSION,
                 capabilities,
@@ -2511,14 +2458,10 @@ fn handle_request(
             }
         }
 
-        AgentRequest::Shutdown => {
-            info!("shutdown requested");
-            // Sync filesystem before shutdown to prevent corruption
-            sync_and_unmount_storage();
-            AgentResponse::Ok {
-                data: Some(serde_json::json!({"shutdown": true})),
-            }
-        }
+        AgentRequest::Shutdown { .. } => AgentResponse::error(
+            "shutdown must use the connection-level quiescence handler",
+            error_codes::INTERNAL_ERROR,
+        ),
 
         // VM-level background exec — spawn and return PID immediately
         AgentRequest::VmExec {
