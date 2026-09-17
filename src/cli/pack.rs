@@ -518,98 +518,81 @@ impl PackCreateCmd {
                 .map_err(|e| Error::agent("collect layers", e.to_string()))?;
         } else {
             // Multiple layers — merge in the VM so runtime gets a single
-            // lowerdir that always mounts instantly.
+            // lowerdir that always mounts instantly. The merge is a read-only
+            // overlay mount whose tar streams straight to the host: no merged
+            // copy and no staged archive on the guest's RAM-sized /tmp, and
+            // whiteouts/opaque markers resolve exactly as the runtime applies
+            // them — a `cp -a` merge resurrected deleted paths.
             println!(
                 "Merging {} layers in VM (one-time cost)...",
                 image_info.layer_count
             );
 
-            // Build the merge command: extract each layer in order (bottom
-            // first), then tar the result. Layer order in image_info.layers
-            // is bottom-to-top, which is the correct copy order.
-            let layer_paths: Vec<String> = image_info
+            // The agent stacks lowerdirs topmost-first, the same order the
+            // runtime container mount uses; image_info.layers lists them
+            // bottom-up, so reverse. Driven agent-side rather than through
+            // `mount(8)` over VmExec: `mount(8)` rejects a `lowerdir=` value
+            // past ~255 bytes, which any image with four or more layers
+            // exceeds.
+            let stack: Vec<String> = image_info
                 .layers
                 .iter()
+                .rev()
                 .map(|d| {
                     let id = d.strip_prefix("sha256:").unwrap_or(d);
                     format!("/storage/layers/{}", id)
                 })
                 .collect();
 
-            // Copy layers bottom-up into /tmp/merged, then tar
-            let mut merge_script = String::from("set -e\nmkdir -p /tmp/merged\n");
-            for (i, layer_path) in layer_paths.iter().enumerate() {
-                // cp -a preserves symlinks, permissions, ownership.
-                // Ignore exit code: cp may fail on device files or sockets
-                // that can't be copied, but the layer content is intact.
-                // Redirect stderr so warnings are visible in the output.
-                merge_script.push_str(&format!(
-                    "echo 'Merging layer {}/{}...'\n\
-                     cp -a {}/. /tmp/merged/ || true\n",
-                    i + 1,
-                    image_info.layer_count,
-                    layer_path
-                ));
-            }
-            // Verify disk space wasn't exhausted during merge
-            merge_script.push_str(
-                "if ! df /tmp/merged | awk 'NR==2{if($4<1024){exit 1}}'; then\n\
-                 echo 'MERGE_FAIL: disk full'; exit 1\nfi\n\
-                 echo 'Creating merged tar...'\n\
-                 tar cf /tmp/merged-layers.tar -C /tmp/merged .\n\
-                 echo 'MERGE_OK'\n",
-            );
-
-            let (exit_code, stdout, stderr) = client.vm_exec(
-                vec!["sh".to_string(), "-c".to_string(), merge_script],
-                vec![],
-                None,
-                None,
-                None,
-            )?;
-
-            // stdout/stderr from vm_exec are now Vec<u8>; convert lossily
-            // for content checks and error messages (merge output is ASCII).
-            let stdout_str = String::from_utf8_lossy(&stdout);
-            let stderr_str = String::from_utf8_lossy(&stderr);
-            if exit_code != 0 || !stdout_str.contains("MERGE_OK") {
-                return Err(Error::agent(
-                    "merge layers",
-                    format!(
-                        "layer merge failed (exit {}): {}",
-                        exit_code,
-                        if stderr_str.is_empty() {
-                            &stdout_str
-                        } else {
-                            &stderr_str
-                        }
-                    ),
-                ));
-            }
-
-            // Download the merged tar — streamed to disk (16 MB chunks,
-            // never holds the full tar in memory).
+            // Stream the merged tar to disk (never buffered whole in memory,
+            // never staged in the guest), then content-address it. Stage in
+            // the layers dir so the final rename is atomic on the same
+            // filesystem.
             print!("  Exporting merged layer...");
             let _ = std::io::Write::flush(&mut std::io::stdout());
-            let merged_hash = hex::encode(Sha256::digest(
-                format!("merged-{}", image_info.digest).as_bytes(),
-            ));
-            let merged_digest = format!("sha256:{}", merged_hash);
-            let merged_file = collector.layer_staging_path(&merged_digest);
-
+            let tmp_file = collector
+                .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
+                .with_file_name("merged-layers.tmp");
             let total_bytes = client
-                .read_file_to_path_capped(
-                    "/tmp/merged-layers.tar",
-                    &merged_file,
+                .flatten_layers_to_path(
+                    &stack,
+                    &tmp_file,
                     smolvm::agent::pack_export_max_total(),
                     |_| {},
                 )
                 .map_err(|e| Error::agent("export merged layer", e.to_string()))?;
-            println!(" {} MB done", total_bytes / (1024 * 1024));
+            if total_bytes == 0 {
+                let _ = std::fs::remove_file(&tmp_file);
+                return Err(Error::agent(
+                    "export merged layer",
+                    "merged layer tar is empty",
+                ));
+            }
 
+            let mut hasher = Sha256::new();
+            {
+                use std::io::Read;
+                let mut f = std::fs::File::open(&tmp_file)
+                    .map_err(|e| Error::agent("read merged layer", e.to_string()))?;
+                let mut buf = vec![0u8; 4 * 1024 * 1024];
+                loop {
+                    let n = f
+                        .read(&mut buf)
+                        .map_err(|e| Error::agent("hash merged layer", e.to_string()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+            }
+            let merged_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+            let merged_file = collector.layer_staging_path(&merged_digest);
+            std::fs::rename(&tmp_file, &merged_file)
+                .map_err(|e| Error::agent("write merged layer", e.to_string()))?;
             collector
                 .register_layer(&merged_digest)
                 .map_err(|e| Error::agent("register merged layer", e.to_string()))?;
+            println!(" {} MB done", total_bytes / (1024 * 1024));
         }
 
         // Stop agent and clean up temp VM data. Propagates stop errors
