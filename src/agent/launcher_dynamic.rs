@@ -1378,10 +1378,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn hypervisor_probe_verdict_is_stable() {
-        assert_eq!(
-            hypervisor_vm_create_probe(),
-            hypervisor_vm_create_probe()
-        );
+        assert_eq!(hypervisor_vm_create_probe(), hypervisor_vm_create_probe());
     }
 
     #[test]
