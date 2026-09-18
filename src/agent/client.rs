@@ -1634,7 +1634,8 @@ impl AgentClient {
         branchpoint_outcome(resp, |_| ())
     }
 
-    /// Merge `lowerdirs` (bottom -> top) into a single tar at `output` in the guest.
+    /// Merge `lowerdirs` (topmost first — the order the agent stacks them in)
+    /// into a single tar at `output` in the guest.
     ///
     /// Missing or empty entries are dropped guest-side, so callers can append a
     /// container overlay's upper dir without probing it first.
@@ -1652,8 +1653,8 @@ impl AgentClient {
         expect_ok(resp, "flatten layers")
     }
 
-    /// Merge `lowerdirs` (bottom -> top) and stream the result straight into
-    /// `local_path` as a tar archive.
+    /// Merge `lowerdirs` (topmost first — the order the agent stacks them in)
+    /// and stream the result straight into `local_path` as a tar archive.
     ///
     /// Same merge as [`Self::flatten_layers`], but the archive never lands on the
     /// guest's disk. Prefer this wherever the merged tree can be large: staging
