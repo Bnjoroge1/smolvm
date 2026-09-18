@@ -1087,7 +1087,22 @@ fn hypervisor_vm_create_probe() -> Option<bool> {
             unsafe { destroy() };
         }
     }
-    Some(ret == HV_SUCCESS)
+    Some(hv_probe_verdict(ret))
+}
+
+/// Map an `hv_vm_create` return to the probe verdict. `HV_BUSY` means a VM
+/// already exists in this process — only possible if an earlier create
+/// succeeded, so the host can virtualize. That case is real: libkrun never
+/// calls `hv_vm_destroy`, so a `build_microvm` failure after `hv_vm_create`
+/// (memory map, GIC, device init — all reported as -EINVAL) leaves the VM
+/// occupying the process, and the probe's own create then answers HV_BUSY.
+/// Reading it as incapacity would invert the diagnosis exactly when the real
+/// failure is post-create.
+#[cfg(target_os = "macos")]
+fn hv_probe_verdict(ret: u32) -> bool {
+    const HV_SUCCESS: u32 = 0;
+    const HV_BUSY: u32 = 0xfae9_4002;
+    ret == HV_SUCCESS || ret == HV_BUSY
 }
 
 pub(crate) fn describe_krun_start_error_with_detail(ret: i32, detail: Option<&str>) -> String {
@@ -1339,15 +1354,34 @@ mod tests {
         ));
     }
 
-    // The hv_vm_create probe must answer on any host where Hypervisor.framework
-    // loads: `Some(true)` on capable hardware, `Some(false)` where the host
-    // cannot run VMs (a VM without nested virtualization). `None` would mean
-    // the probe itself broke — framework or symbols missing — which is the only
-    // outcome that makes the EINVAL diagnosis silently wrong.
+    // The verdict mapping is the part that can silently lie: HV_BUSY means a
+    // VM already occupies this process — proof the host CAN virtualize — not
+    // that it cannot. libkrun never destroys a created VM, so a post-create
+    // build failure (still -EINVAL) leaves the probe's own hv_vm_create
+    // answering HV_BUSY.
     #[cfg(target_os = "macos")]
     #[test]
-    fn hypervisor_probe_returns_a_verdict() {
-        assert!(hypervisor_vm_create_probe().is_some());
+    fn hv_probe_verdict_treats_busy_as_capable() {
+        const HV_SUCCESS: u32 = 0;
+        const HV_BUSY: u32 = 0xfae9_4002;
+        const HV_UNSUPPORTED: u32 = 0xfae9_400f;
+        const HV_ERROR: u32 = 0xfae9_4000;
+        assert!(hv_probe_verdict(HV_SUCCESS));
+        assert!(hv_probe_verdict(HV_BUSY));
+        assert!(!hv_probe_verdict(HV_UNSUPPORTED));
+        assert!(!hv_probe_verdict(HV_ERROR));
+    }
+
+    // The probe must answer on any host where Hypervisor.framework loads, and
+    // its verdict must be stable across calls (each probe creates and destroys
+    // its own VM, so a second call sees the same host state).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hypervisor_probe_verdict_is_stable() {
+        assert_eq!(
+            hypervisor_vm_create_probe(),
+            hypervisor_vm_create_probe()
+        );
     }
 
     #[test]
