@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use smolvm_pack::format::PackManifest;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path};
@@ -936,7 +936,7 @@ pub fn materialize_with_base(
     let base = match (&_base_guard, base) {
         (Some(_), Some(base)) => read_index(base)
             .ok()
-            .map(|index| (base.to_path_buf(), index)),
+            .map(|index| (base.to_path_buf(), index, base_identities(base))),
         _ => None,
     };
     fs::create_dir(output)?;
@@ -950,13 +950,23 @@ pub fn materialize_with_base(
                 .parent()
                 .ok_or_else(|| invalid("missing asset parent"))?,
         )?;
-        let base_entry = base.as_ref().and_then(|(dir, index)| {
+        let base_entry = base.as_ref().and_then(|(dir, index, _)| {
             index
                 .files
                 .iter()
                 .find(|file| file.path == entry.path)
                 .map(|file| (dir.join(&file.path), file))
         });
+        // Unchanged since this process wrote and verified it: the clone of it
+        // needs no read-back.
+        let trusted = base.as_ref().zip(base_entry.as_ref()).is_some_and(
+            |((_, _, identities), (source, _))| {
+                identities
+                    .get(&entry.path)
+                    .zip(file_identity(source))
+                    .is_some_and(|(recorded, current)| *recorded == current)
+            },
+        );
         let mut cloned = match &base_entry {
             Some((source, _)) => clone_file(source, &destination)?,
             None => false,
@@ -978,6 +988,8 @@ pub fn materialize_with_base(
         // Size the file first: ranges no worker writes stay holes (or keep
         // the base's bytes, which the diff below has checked are identical).
         file.set_len(entry.size)?;
+        let data_map = cloned.then(|| chunk_data_map(&file, entry.size)).flatten();
+        let data_map = data_map.as_ref();
         let base_chunks: &[Option<String>] = match (&base_entry, cloned) {
             (Some((_, base)), true) => &base.chunks,
             _ => &[],
@@ -992,6 +1004,10 @@ pub fn materialize_with_base(
                 let offset = index as u64 * CHUNK_SIZE as u64;
                 let count = (entry.size - offset).min(CHUNK_SIZE as u64) as usize;
                 let unchanged = base_chunks.get(index).is_some_and(|base| base == hash);
+                if unchanged && trusted {
+                    reused.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
                 match hash {
                     Some(hash) => Some((offset, count, Some(hash), unchanged)),
                     // A hole where the clone still has data must be punched;
@@ -1010,7 +1026,13 @@ pub fn materialize_with_base(
                 // private clone so a later change to the base cannot race
                 // verification against use.
                 if unchanged
-                    && cloned_chunk_matches(&file, offset, count, hash.map(String::as_str))?
+                    && cloned_chunk_matches(
+                        &file,
+                        data_map,
+                        offset,
+                        count,
+                        hash.map(String::as_str),
+                    )?
                 {
                     reused.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
@@ -1033,6 +1055,7 @@ pub fn materialize_with_base(
         tracing::debug!(
             path = %entry.path,
             cloned,
+            trusted,
             reused_chunks = reused,
             written_chunks = written,
             "checkpoint file materialized"
@@ -1090,6 +1113,23 @@ pub fn promote_base(directory: &Path, materialized: &Path, base_root: &Path) -> 
     }
     fs::copy(directory.join(INDEX), fresh.join(INDEX))?;
     File::create(fresh.join(BASE_LOCK))?;
+    // Stamp what we just cloned. Every byte of it came from an object this
+    // process verified by hash, so the content is known good here; recording
+    // the files' identity lets a later restore prove nothing has touched them
+    // since, instead of re-reading gigabytes to learn the same thing.
+    let identities: HashMap<String, String> = read_index(directory)
+        .map(|index| {
+            index
+                .files
+                .iter()
+                .filter_map(|file| {
+                    file_identity(&fresh.join(&file.path))
+                        .map(|identity| (file.path.clone(), identity))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    fs::write(fresh.join(BASE_IDENTITY), serde_json::to_vec(&identities)?)?;
     // The stable exclusive lock also covers publication and old-base cleanup.
     match fs::rename(base_root, &old) {
         Ok(()) => {}
@@ -1111,21 +1151,116 @@ pub fn promote_base(directory: &Path, materialized: &Path, base_root: &Path) -> 
 
 const BASE_LOCK: &str = ".lock";
 
+/// Which chunks of `file` hold data, from a single walk of its extents.
+///
+/// Verification only has to tell a hole from data, and `SEEK_DATA` answers
+/// that — but it takes the file's lock, so asking once per chunk from every
+/// worker turns a second of verification into half a minute of contention on
+/// a sparse multi-gigabyte disk. Walking the extents once is a few hundred
+/// seeks for the whole file and leaves the workers lock-free.
+///
+/// `None` where the filesystem cannot report extents: callers then verify by
+/// reading, exactly as before.
+fn chunk_data_map(file: &File, size: u64) -> Option<Vec<bool>> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = file.as_raw_fd();
+        let mut has_data = vec![false; size.div_ceil(CHUNK_SIZE as u64) as usize];
+        let mut offset = 0i64;
+        while (offset as u64) < size {
+            let data = unsafe { libc::lseek(fd, offset, libc::SEEK_DATA) };
+            if data < 0 {
+                // No data at or after this offset: the rest is a hole.
+                return match io::Error::last_os_error().raw_os_error() {
+                    Some(libc::ENXIO) => Some(has_data),
+                    _ => None,
+                };
+            }
+            let end = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+            if end < 0 {
+                return None;
+            }
+            let first = data as u64 / CHUNK_SIZE as u64;
+            let last = (end as u64).min(size).div_ceil(CHUNK_SIZE as u64);
+            for chunk in has_data.iter_mut().take(last as usize).skip(first as usize) {
+                *chunk = true;
+            }
+            if end <= data {
+                return None;
+            }
+            offset = end;
+        }
+        Some(has_data)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, size);
+        None
+    }
+}
+
+/// Records what each base file was when this process wrote it, so a later
+/// restore can tell "still exactly what we cloned into place" from "something
+/// replaced, truncated or rewrote it" without reading the bytes back.
+const BASE_IDENTITY: &str = ".identity";
+
+/// Filesystem identity of one base file: device, inode, length and
+/// modification time. Any in-place write moves the mtime, any replacement
+/// moves the inode, and any truncation moves the length, so a match means the
+/// file is byte-for-byte the one whose chunk hashes the index records.
+fn file_identity(path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(path).ok()?;
+        Some(format!(
+            "{}:{}:{}:{}.{}",
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let meta = fs::symlink_metadata(path).ok()?;
+        let modified = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(format!(
+            "{}:{}.{}",
+            meta.len(),
+            modified.as_secs(),
+            modified.subsec_nanos()
+        ))
+    }
+}
+
+/// Read the identities recorded for a base, as `path -> identity`.
+fn base_identities(base_root: &Path) -> HashMap<String, String> {
+    fs::read_to_string(base_root.join(BASE_IDENTITY))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
 fn cloned_chunk_matches(
     file: &File,
+    data_map: Option<&Vec<bool>>,
     offset: u64,
     count: usize,
     hash: Option<&str>,
 ) -> io::Result<bool> {
-    #[cfg(unix)]
-    if hash.is_none() {
-        use std::os::fd::AsRawFd;
-        // A real filesystem hole is intrinsically zero; avoid reading it.
-        // All data access elsewhere is positional, so lseek's cursor is unused.
-        let data = unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, libc::SEEK_DATA) };
-        if (data >= 0 && data as u64 >= offset + count as u64)
-            || (data < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO))
-        {
+    // A hole is intrinsically zero, so where the extent map says this range
+    // holds none, there is nothing to read back.
+    if let (None, Some(map)) = (hash, data_map) {
+        let first = (offset / CHUNK_SIZE as u64) as usize;
+        let last = ((offset + count as u64).div_ceil(CHUNK_SIZE as u64) as usize).min(map.len());
+        if !map[first..last].iter().any(|held| *held) {
             return Ok(true);
         }
     }
@@ -1489,20 +1624,81 @@ mod tests {
         }
     }
 
+    /// The extent map is what keeps verification off the per-chunk seek that
+    /// serialized every worker on the file's lock: it must call a hole a hole,
+    /// call data data, and — because a base whose file disagrees with its
+    /// index is exactly what verification exists to catch — still refuse a
+    /// range the map reports as holding data.
+    #[cfg(unix)]
+    #[test]
+    fn the_extent_map_distinguishes_holes_from_data_without_reading() {
+        use std::os::unix::fs::FileExt;
+        // The hole has to be large enough for the filesystem to keep as one:
+        // a gap of a chunk or two is smaller than APFS's allocation grain and
+        // comes back as data, which is safe (it only costs a read-back) but
+        // would make this test assert nothing.
+        const CHUNKS: usize = 66;
+        const LAST: usize = CHUNKS - 1;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sparse.img");
+        let file = File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let size = CHUNKS as u64 * CHUNK_SIZE as u64;
+        file.set_len(size).unwrap();
+        file.write_all_at(&vec![0xA5; CHUNK_SIZE], 0).unwrap();
+        file.write_all_at(&vec![0x5A; CHUNK_SIZE], LAST as u64 * CHUNK_SIZE as u64)
+            .unwrap();
+        file.sync_all().unwrap();
+
+        let Some(map) = chunk_data_map(&file, size) else {
+            // A filesystem that cannot report extents falls back to reading,
+            // which the sibling test already covers.
+            return;
+        };
+        assert_eq!(map.len(), CHUNKS);
+        assert!(map[0] && map[LAST], "written chunks hold data: {map:?}");
+        let middle = CHUNKS / 2;
+        if map[middle] {
+            // This filesystem did not keep the gap as a hole; nothing to assert.
+            return;
+        }
+
+        // A hole the map knows about needs no read-back.
+        let hole_offset = middle as u64 * CHUNK_SIZE as u64;
+        assert!(cloned_chunk_matches(&file, Some(&map), hole_offset, CHUNK_SIZE, None).unwrap());
+        // A chunk the map reports as data is not accepted as a hole: the
+        // caller punches it instead of leaving the base's bytes behind.
+        assert!(!cloned_chunk_matches(&file, Some(&map), 0, CHUNK_SIZE, None).unwrap());
+        // Data chunks still verify against their hash, map or not.
+        let first = vec![0xA5; CHUNK_SIZE];
+        assert!(
+            cloned_chunk_matches(&file, Some(&map), 0, CHUNK_SIZE, Some(&digest(&first))).unwrap()
+        );
+        assert!(
+            !cloned_chunk_matches(&file, Some(&map), 0, CHUNK_SIZE, Some(&digest(b"other")))
+                .unwrap()
+        );
+    }
+
     #[test]
     fn cloned_chunk_verification_checks_data_holes_and_short_reads() {
         let file = tempfile::tempfile().unwrap();
         file.set_len((2 * CHUNK_SIZE) as u64).unwrap();
         let bytes = vec![7; CHUNK_SIZE];
         write_at(&file, 0, &bytes).unwrap();
-        assert!(cloned_chunk_matches(&file, 0, CHUNK_SIZE, Some(&digest(&bytes))).unwrap());
-        assert!(cloned_chunk_matches(&file, CHUNK_SIZE as u64, CHUNK_SIZE, None).unwrap());
+        assert!(cloned_chunk_matches(&file, None, 0, CHUNK_SIZE, Some(&digest(&bytes))).unwrap());
+        assert!(cloned_chunk_matches(&file, None, CHUNK_SIZE as u64, CHUNK_SIZE, None).unwrap());
         write_at(&file, 0, &[9]).unwrap();
-        assert!(!cloned_chunk_matches(&file, 0, CHUNK_SIZE, Some(&digest(&bytes))).unwrap());
+        assert!(!cloned_chunk_matches(&file, None, 0, CHUNK_SIZE, Some(&digest(&bytes))).unwrap());
         write_at(&file, CHUNK_SIZE as u64, &[9]).unwrap();
-        assert!(!cloned_chunk_matches(&file, CHUNK_SIZE as u64, CHUNK_SIZE, None).unwrap());
+        assert!(!cloned_chunk_matches(&file, None, CHUNK_SIZE as u64, CHUNK_SIZE, None).unwrap());
         file.set_len(17).unwrap();
-        assert!(cloned_chunk_matches(&file, 0, CHUNK_SIZE, Some(&digest(&bytes))).is_err());
+        assert!(cloned_chunk_matches(&file, None, 0, CHUNK_SIZE, Some(&digest(&bytes))).is_err());
     }
 
     #[test]
@@ -1802,6 +1998,55 @@ mod tests {
         materialize_with_base(&saved, &again, Some(&base)).unwrap();
         assert_eq!(
             fs::read(again.join("checkpoint/memory.bin")).unwrap(),
+            bytes
+        );
+    }
+
+    /// A base this process wrote and stamped is trusted on the next restore,
+    /// which is what keeps a jump from re-reading gigabytes to confirm bytes
+    /// it just wrote. Touch the base's file and the stamp no longer matches,
+    /// so verification comes back and the corruption is still caught.
+    #[test]
+    fn a_stamped_base_is_trusted_until_its_file_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let saved = root.path().join("saved");
+        let base = root.path().join("base");
+        let bytes: Vec<u8> = (0..4 * CHUNK_SIZE).map(|index| (index / 7) as u8).collect();
+        capture(&cache, &saved, &bytes);
+        let first = root.path().join("first");
+        materialize(&saved, &first).unwrap();
+        if !promote_base(&saved, &first, &base).unwrap() {
+            return;
+        }
+        let stamped = base_identities(&base);
+        assert!(
+            stamped.contains_key("checkpoint/memory.bin"),
+            "promotion records what it wrote: {stamped:?}"
+        );
+
+        // Trusted: restoring again reproduces the bytes.
+        let again = root.path().join("again");
+        materialize_with_base(&saved, &again, Some(&base)).unwrap();
+        assert_eq!(
+            fs::read(again.join("checkpoint/memory.bin")).unwrap(),
+            bytes
+        );
+
+        // Corrupt the base's file. Its identity no longer matches the stamp,
+        // so the restore verifies and rewrites from the store rather than
+        // handing the caller the damaged bytes.
+        let victim = base.join("checkpoint/memory.bin");
+        fs::write(&victim, vec![0xEE; bytes.len()]).unwrap();
+        assert_ne!(
+            stamped.get("checkpoint/memory.bin").cloned(),
+            file_identity(&victim),
+            "a rewritten file must not keep its recorded identity"
+        );
+        let third = root.path().join("third");
+        materialize_with_base(&saved, &third, Some(&base)).unwrap();
+        assert_eq!(
+            fs::read(third.join("checkpoint/memory.bin")).unwrap(),
             bytes
         );
     }
