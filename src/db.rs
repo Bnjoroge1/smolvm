@@ -17,7 +17,7 @@ use crate::pool::{
 };
 use parking_lot::{Condvar, Mutex};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -621,11 +621,12 @@ impl SmolvmDb {
         })
     }
 
-    /// List all VM records.
+    /// List all VM records, ordered by name so every listing of the same
+    /// machines comes back in the same order.
     pub fn list_vms(&self) -> Result<Vec<(String, VmRecord)>> {
         self.with_read_conn(|conn| {
             let mut stmt = conn
-                .prepare_cached("SELECT name, data FROM vms")
+                .prepare_cached("SELECT name, data FROM vms ORDER BY name")
                 .db_err("prepare list_vms")?;
             let rows = stmt
                 .query_map([], |row| {
@@ -2147,7 +2148,7 @@ impl SmolvmDb {
     }
 
     /// Load all config settings and VM records in a single transaction.
-    pub fn load_all(&self) -> Result<(HashMap<String, String>, HashMap<String, VmRecord>)> {
+    pub fn load_all(&self) -> Result<(HashMap<String, String>, BTreeMap<String, VmRecord>)> {
         self.with_conn(|conn| {
             let tx = conn.transaction().db_err("begin read transaction")?;
 
@@ -2169,7 +2170,7 @@ impl SmolvmDb {
                 }
             }
 
-            let mut vms = HashMap::new();
+            let mut vms = BTreeMap::new();
             {
                 let mut stmt = tx
                     .prepare_cached("SELECT name, data FROM vms")
@@ -2280,6 +2281,17 @@ mod tests {
         db.insert_vm("saved", &record).unwrap();
         assert!(db.claim_pause_operation("saved", "save-2", true).is_err());
         db.claim_pause_operation("saved", "save-3", true).unwrap();
+    }
+
+    #[test]
+    fn listed_machines_come_back_in_name_order() {
+        let (_dir, db) = temp_db();
+        for name in ["web", "api", "worker", "db"] {
+            let record = VmRecord::new(name.into(), 1, 512, vec![], vec![], false);
+            db.insert_vm(name, &record).unwrap();
+        }
+        let names: Vec<String> = db.list_vms().unwrap().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["api", "db", "web", "worker"]);
     }
 
     #[test]
