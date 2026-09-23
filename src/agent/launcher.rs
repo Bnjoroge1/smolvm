@@ -10,7 +10,7 @@ use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use crate::network::backend::COMPAT_NET_FEATURES;
 use crate::network::backend::TSI_FEATURE_HIJACK_INET;
-use crate::network::{plan_launch_network, EffectiveNetworkBackend};
+use crate::network::EffectiveNetworkBackend;
 use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::{libkrun_filename, libkrunfw_filename};
 
@@ -265,6 +265,9 @@ pub struct LaunchFeatures {
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// Credential policy to enforce: mounts the machine CA and runs the
+    /// interceptor beside the network stack for the VM's lifetime.
+    pub credentials: Option<crate::credentials::CredentialLaunch>,
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
     /// The launcher assigns each a vsock port, wires libkrun, and tells the guest
     /// agent to start the matching relay.
@@ -579,6 +582,10 @@ pub struct LaunchConfig<'a> {
     /// while privileged. When present, the virtio-net arm bridges the guest NIC to
     /// the tap instead of running the NAT gateway. `None` for non-pod VMs.
     pub pod_net: Option<crate::agent::pod_net::PodNetLaunch>,
+    /// Credential policy for this machine, when it has one. The launcher mounts
+    /// the machine CA read-only at the guest credentials directory and, on
+    /// virtio-net, starts the interceptor that HTTPS flows are redirected to.
+    pub credentials: Option<&'a crate::credentials::CredentialLaunch>,
 }
 
 /// Launch the agent VM using libkrun.
@@ -620,6 +627,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         egress_refresh_hosts,
         egress_telemetry,
         pod_net,
+        credentials,
     } = config;
     // `pod_net` drives the Linux-only pod netns-tap datapath; on other targets the
     // field exists (cross-platform LaunchConfig) but is never read.
@@ -701,6 +709,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
             }
         }
+    }
+    // Only the public CA is exposed; the signing key stays in the parent dir.
+    if let Some(credentials) = credentials {
+        credentials.ensure_ca()?;
+        mounts_vec.push(credentials.guest_ca_mount());
     }
     let mounts: &[crate::data::storage::HostMount] = &mounts_vec;
 
@@ -1033,7 +1046,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());
+        let network_plan = select_network_plan(
+            resources,
+            *dns_filter_enabled,
+            port_mappings.len(),
+            credentials.is_some(),
+        );
+        // Lives until the VM exits: dropping it would stop substitution.
+        let mut _credential_interceptor: Option<smolvm_credentials::Interceptor> = None;
 
         // `mut` is only needed on unix (the VirtioNet arm assigns it); on
         // Windows the runtime is owned by the accept thread, so the launcher's
@@ -1161,6 +1181,41 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     }
                 }
 
+                // TSI terminates guest connects inside libkrun, so redirecting
+                // HTTPS flows to the interceptor needs the fork's hook; without
+                // it a credential policy cannot be enforced on this backend.
+                if let Some(credentials) = credentials {
+                    let Some(set_intercept) = krun.set_stream_intercept else {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure credentials",
+                            "this libkrun cannot redirect TSI flows (krun_set_stream_intercept not found); \
+                             use the default virtio-net backend or update libkrun",
+                        ));
+                    };
+                    let interceptor = credentials.start_interceptor().inspect_err(|_| {
+                        krun_free_ctx(ctx);
+                    })?;
+                    let endpoint = interceptor.endpoint();
+                    let addr = CString::new(endpoint.addr.to_string()).expect("socket address");
+                    let token: String = endpoint.token.iter().map(|b| format!("{b:02x}")).collect();
+                    let token = CString::new(token).expect("hex token");
+                    if set_intercept(
+                        ctx,
+                        addr.as_ptr(),
+                        token.as_ptr(),
+                        smolvm_network::tcp_relay::INTERCEPTED_PORT,
+                    ) < 0
+                    {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure credentials",
+                            "krun_set_stream_intercept failed",
+                        ));
+                    }
+                    _credential_interceptor = Some(interceptor);
+                }
+
                 tracing::info!("network backend: tsi");
                 None
             }
@@ -1188,6 +1243,16 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 .inspect_err(|_| krun_free_ctx(ctx))?;
                 guest_network.host_service = crate::network::launch::guest_host_service()
                     .map_err(|reason| Error::config("configure guest rollout ingress", reason))?;
+                // The interceptor runs in this process beside the network stack;
+                // the relay dials it for every guest HTTPS flow the egress policy
+                // admits, so the guest cannot route around substitution.
+                if let Some(credentials) = credentials {
+                    let interceptor = credentials.start_interceptor().inspect_err(|_| {
+                        krun_free_ctx(ctx);
+                    })?;
+                    guest_network.intercept = Some(interceptor.endpoint());
+                    _credential_interceptor = Some(interceptor);
+                }
                 // A custom resolver (--dns) becomes the gateway's upstream: the
                 // guest still points at the gateway (100.96.0.1 by default), which forwards
                 // queries to this address instead of the default.
@@ -2334,10 +2399,16 @@ fn select_network_plan(
     resources: &VmResources,
     dns_filter_enabled: bool,
     port_count: usize,
+    has_credentials: bool,
 ) -> crate::network::LaunchNetworkPlan {
     let dns_filter_placeholder = [String::from("configured")];
     let dns_filter_hosts = dns_filter_enabled.then_some(dns_filter_placeholder.as_slice());
-    plan_launch_network(resources, dns_filter_hosts, port_count)
+    crate::network::plan_launch_network_with(
+        resources,
+        dns_filter_hosts,
+        port_count,
+        has_credentials,
+    )
 }
 
 /// Resolve a hostname to /32 CIDR strings for the egress-refresh thread.
