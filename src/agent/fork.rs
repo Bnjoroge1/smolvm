@@ -434,14 +434,15 @@ fn fork_base_already_paused(status: &str) -> bool {
     status.trim() == "OK paused"
 }
 
-/// Linux/KVM and macOS/HVF can atomically checkpoint a fork generation and
-/// resume the source on private RAM and disk layers. Other hosts retain the
-/// established frozen fork-base behavior.
+/// Linux/x86_64 KVM can atomically checkpoint a fork generation and resume
+/// the source on private RAM and disk layers. Other hosts, macOS included,
+/// keep the frozen fork-base behavior: the first fork freezes the source and
+/// publishes one retained checkpoint, and every later fork restores from it
+/// without touching the source again. A pool that forks runners from one
+/// long-lived golden wants exactly that: the golden never runs again, so its
+/// checkpoint and disks cannot drift between forks.
 pub fn fork_continue_enabled() -> bool {
-    cfg!(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        target_os = "macos"
-    ))
+    cfg!(all(target_os = "linux", target_arch = "x86_64"))
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
