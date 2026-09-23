@@ -2460,6 +2460,7 @@ mod tests {
             disks: Vec::new(),
             workload: None,
             network: None,
+            packed_layers: None,
             lineage: Some(CheckpointLineage {
                 id: id.into(),
                 parent: parent.map(str::to_string),

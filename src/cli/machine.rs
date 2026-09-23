@@ -4040,13 +4040,16 @@ impl CreateCmd {
             gpu: manifest.gpu,
             gpu_vram_mib: None,
             rosetta: false,
-            // A live checkpoint uses the pack only as a transport envelope.
-            // Its block devices and running guest state are restored from the
-            // checkpoint payload, so treating the artifact as an OCI-layer
-            // source would attach an extra virtiofs device and change the
-            // captured device topology. The payload is private to the machine
-            // after install and no longer depends on the original artifact.
-            source_smolmachine: checkpoint.is_none().then_some(canonical_path),
+            // Build-time validation needs to know that a packed-layer
+            // checkpoint already has its image locally. This placeholder is
+            // replaced by the verified source pack before the record commits.
+            // For an ordinary checkpoint, the transport pack is never an
+            // OCI-layer source and must not add a virtiofs device.
+            source_smolmachine: (checkpoint.is_none()
+                || checkpoint
+                    .as_ref()
+                    .is_some_and(|checkpoint| checkpoint.packed_layers.is_some()))
+            .then_some(canonical_path),
         };
 
         let resources = VmResources {
@@ -4195,6 +4198,15 @@ impl CreateCmd {
                 let vm_data_dir = smolvm::agent::vm_data_dir(&name_for_layers);
                 smolvm::portable_checkpoint::install(&pack_content_dir, &vm_data_dir, checkpoint)?;
                 smolvm::portable_checkpoint::discard_transport_pack(&vm_data_dir)?;
+                if let Some((sidecar, reference)) =
+                    smolvm::portable_checkpoint::attach_cached_checkpoint_pack(
+                        &name_for_layers,
+                        checkpoint,
+                    )?
+                {
+                    record.source_smolmachine = Some(sidecar);
+                    record.source_registry_ref = reference;
+                }
             }
 
             reservation.commit(&record)?;

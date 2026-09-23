@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 use smolvm_pack::assets::AssetCollector;
 use smolvm_pack::format::{
     CheckpointAsset, CheckpointCpuContract, CheckpointDisk, CheckpointDiskFile, CheckpointNetwork,
-    CheckpointPort, CheckpointWorkload, PackManifest, PackMode, PortableCheckpointManifest,
+    CheckpointPackedLayers, CheckpointPort, CheckpointWorkload, PackManifest, PackMode,
+    PortableCheckpointManifest,
 };
 use smolvm_pack::packer::Packer;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -31,6 +32,12 @@ pub const HISTORY_FORMAT_VERSION: u32 = 5;
 pub const RUNTIME_ABI: &str = "libkrun-portable-snapshot-v1";
 /// Device topology supported by the initial portable checkpoint profile.
 pub const DEVICE_PROFILE: &str = "smolvm-basic-v1";
+/// The basic profile plus one read-only virtio-fs device serving a pack's image
+/// layers. Distinct so a runtime that cannot re-attach the pack refuses the
+/// checkpoint instead of resuming into a device layout it does not reproduce.
+pub const DEVICE_PROFILE_PACKED_LAYERS: &str = "smolvm-packed-layers-v1";
+const FIXED_MEMORY_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Directory inside an extracted artifact containing live state.
 pub const ASSET_DIR: &str = "checkpoint";
 
@@ -493,7 +500,7 @@ pub fn restore_from_path_at(
         committed: false,
     };
 
-    let record = restored_record(name, &manifest, checkpoint)?;
+    let mut record = restored_record(name, &manifest, checkpoint)?;
     let vm_data = crate::agent::vm_data_dir(name);
     let cache_dir = crate::agent::machine_layers_cache_dir(name);
     let result = (|| -> Result<()> {
@@ -524,6 +531,10 @@ pub fn restore_from_path_at(
         install(&cache_dir, &vm_data, checkpoint)?;
         log_phase(name, "restore_install", &mut phase);
         discard_transport_pack(&vm_data)?;
+        if let Some((sidecar, reference)) = attach_cached_checkpoint_pack(name, checkpoint)? {
+            record.source_smolmachine = Some(sidecar);
+            record.source_registry_ref = reference;
+        }
         if !reservation
             .db
             .commit_reserved_vm(name, &reservation.token, &record)?
@@ -1207,6 +1218,7 @@ fn capture_with_completion(
         && !retain
         && crate::agent::fork::control_socket_cmd(&control, "SAVE_SPARSE_CAPABILITIES")?.trim()
             == "OK sparse-stream-v1 ownership-v1";
+    let max_memory_image = max_checkpoint_memory_image(vm.mem, vm.source_smolmachine.is_some())?;
     crate::agent::fork::sync_fork_source(name)?;
     log_phase(name, "capture_sync", &mut phase);
     if stop_after_capture {
@@ -1214,13 +1226,23 @@ fn capture_with_completion(
     }
     let snapshot_dir = staging_dir.join(ASSET_DIR);
     let pause_started = std::time::Instant::now();
+    // Deferred RAM capture rebases the live source's mappings. A packed
+    // image's virtio-fs DAX window contains file mappings that must remain
+    // intact for the source to keep executing after the checkpoint.
+    let use_deferred_save =
+        !cfg!(all(target_os = "linux", target_arch = "x86_64")) || vm.source_smolmachine.is_none();
+    let command = if use_deferred_save {
+        "PREPARE_SAVE"
+    } else {
+        "SAVE"
+    };
     let mut reply = crate::agent::fork::control_socket_cmd_with_timeout(
         &control,
-        &format!("PREPARE_SAVE {}", runtime_snapshot.display()),
+        &format!("{command} {}", runtime_snapshot.display()),
         std::time::Duration::from_secs(30 * 60),
     )?;
-    let prepared = reply.starts_with("OK");
-    tracing::info!(machine = name, command = "PREPARE_SAVE", reply = ?reply.trim(), "checkpoint memory protocol reply");
+    let prepared = use_deferred_save && reply.starts_with("OK");
+    tracing::info!(machine = name, command, reply = ?reply.trim(), "checkpoint memory protocol reply");
     if !prepared
         && options.store_dir.is_none()
         && (reply.starts_with("ERR ENOTSUP") || reply.trim() == "ERR EINVAL unknown command")
@@ -1285,38 +1307,56 @@ fn capture_with_completion(
     };
     let mut streamed_memory = match sparse_socket.as_mut() {
         Some(stream) => Some(
-            smolvm_pack::checkpoint_stream::CheckpointStream::read(
-                stream,
-                (u64::from(vm.mem) + 2048) * 1024 * 1024,
-            )
-            .map_err(|e| Error::agent("read sparse checkpoint boundary", e.to_string()))?,
+            smolvm_pack::checkpoint_stream::CheckpointStream::read(stream, max_memory_image)
+                .map_err(|e| Error::agent("read sparse checkpoint boundary", e.to_string()))?,
         ),
         None => None,
     };
 
     let mut stored = stored;
     let stored_memory = if let Some((_, writer)) = stored.as_mut() {
-        let mut stream = crate::platform::uds::UdsStream::connect(&pause.control)
-            .map_err(|e| Error::agent("connect checkpoint stream", e.to_string()))?;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(30 * 60)))
-            .map_err(|e| Error::agent("configure checkpoint stream", e.to_string()))?;
-        writeln!(stream, "FINISH_SAVE_STREAM {}", runtime_snapshot.display())
-            .map_err(|e| Error::agent("request checkpoint stream", e.to_string()))?;
-        let memory = writer
-            .ingest_memory(&mut stream, (u64::from(vm.mem) + 2048) * 1024 * 1024)
-            .map_err(|e| Error::agent("store checkpoint memory", e.to_string()))?;
-        let mut reply = String::new();
-        stream
-            .take(4096)
-            .read_to_string(&mut reply)
-            .map_err(|e| Error::agent("complete checkpoint stream", e.to_string()))?;
-        tracing::info!(machine = name, command = "FINISH_SAVE_STREAM", reply = ?reply.trim(), "checkpoint memory protocol reply");
-        if !reply.starts_with("OK saved (") {
-            return Err(Error::agent("complete checkpoint stream", reply));
+        if prepared {
+            let mut stream = crate::platform::uds::UdsStream::connect(&pause.control)
+                .map_err(|e| Error::agent("connect checkpoint stream", e.to_string()))?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(30 * 60)))
+                .map_err(|e| Error::agent("configure checkpoint stream", e.to_string()))?;
+            writeln!(stream, "FINISH_SAVE_STREAM {}", runtime_snapshot.display())
+                .map_err(|e| Error::agent("request checkpoint stream", e.to_string()))?;
+            let memory = writer
+                .ingest_memory(&mut stream, max_memory_image)
+                .map_err(|e| Error::agent("store checkpoint memory", e.to_string()))?;
+            let mut reply = String::new();
+            stream
+                .take(4096)
+                .read_to_string(&mut reply)
+                .map_err(|e| Error::agent("complete checkpoint stream", e.to_string()))?;
+            tracing::info!(machine = name, command = "FINISH_SAVE_STREAM", reply = ?reply.trim(), "checkpoint memory protocol reply");
+            if !reply.starts_with("OK saved (") {
+                return Err(Error::agent("complete checkpoint stream", reply));
+            }
+            pause.prepared_save = None;
+            Some(memory)
+        } else {
+            let path = runtime_snapshot.join("memory.bin");
+            let mut file = std::fs::File::open(&path)
+                .map_err(|e| Error::agent("read checkpoint memory", e.to_string()))?;
+            let size = file
+                .metadata()
+                .map_err(|e| Error::agent("inspect checkpoint memory", e.to_string()))?
+                .len();
+            if size == 0 || size > max_memory_image {
+                return Err(Error::agent(
+                    "store checkpoint memory",
+                    "checkpoint RAM image exceeds configured memory layout",
+                ));
+            }
+            Some(
+                writer
+                    .ingest("checkpoint/memory.bin", size, 0o600, &mut file)
+                    .map_err(|e| Error::agent("store checkpoint memory", e.to_string()))?,
+            )
         }
-        pause.prepared_save = None;
-        Some(memory)
     } else {
         if prepared && streamed_memory.is_none() {
             let reply = crate::agent::fork::control_socket_cmd_with_timeout(
@@ -1399,6 +1439,7 @@ fn capture_with_completion(
     manifest.entrypoint = vm.entrypoint.clone();
     manifest.cpus = vm.cpus;
     manifest.mem = vm.mem;
+    let packed_layers = checkpoint_packed_layers(name, vm)?;
     manifest.checkpoint = Some(PortableCheckpointManifest {
         version: FORMAT_VERSION,
         runtime_abi: RUNTIME_ABI.to_string(),
@@ -1417,7 +1458,12 @@ fn capture_with_completion(
             vm.overlay_gb
                 .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB),
         ),
-        device_profile: DEVICE_PROFILE.to_string(),
+        device_profile: if packed_layers.is_some() {
+            DEVICE_PROFILE_PACKED_LAYERS
+        } else {
+            DEVICE_PROFILE
+        }
+        .to_string(),
         state: describe_asset(
             &snapshot_dir.join("checkpoint.bin"),
             "checkpoint/checkpoint.bin",
@@ -1451,6 +1497,7 @@ fn capture_with_completion(
         disks: checkpoint_disks,
         workload: checkpoint_workload(name, vm),
         network: Some(checkpoint_network(vm)),
+        packed_layers,
         lineage: Some(smolvm_pack::format::CheckpointLineage {
             id: checkpoint_id.clone(),
             parent: vm.checkpoint_head.clone(),
@@ -1948,6 +1995,139 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
     Ok(())
 }
 
+/// Identify the pack a machine mounts its image layers from, if any, so a
+/// restore can attach the same layers again.
+fn checkpoint_packed_layers(name: &str, vm: &VmRecord) -> Result<Option<CheckpointPackedLayers>> {
+    let Some(sidecar) = vm.source_smolmachine.as_deref() else {
+        return Ok(None);
+    };
+    let sidecar = Path::new(sidecar);
+    let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
+        .map_err(|error| Error::agent("read pack footer", error.to_string()))?;
+    // The shared store records the artifact digest when it extracts a pack;
+    // hash the sidecar only when that record is unavailable.
+    let recorded =
+        crate::agent::read_shared_pack_pointer(&crate::agent::machine_layers_cache_dir(name))
+            .and_then(|shared| smolvm_pack::extract::read_shared_artifact_sha256(&shared).ok());
+    let artifact_sha256 = match recorded {
+        Some(digest) => digest,
+        None => sha256_file(sidecar)?,
+    };
+    let digest = format!(
+        "sha256:{}",
+        artifact_sha256
+            .trim_start_matches("sha256:")
+            .to_ascii_lowercase()
+    );
+    let cache = smolvm_registry::BlobCache::open_default()
+        .map_err(|error| Error::agent("open pack cache", error.to_string()))?;
+    if cache.get(&digest).is_none() {
+        cache
+            .put_file_verified(&digest, sidecar)
+            .map_err(|error| Error::agent("cache checkpoint pack", error.to_string()))?;
+    }
+    Ok(Some(CheckpointPackedLayers {
+        artifact_sha256: digest.trim_start_matches("sha256:").to_string(),
+        footer_checksum: footer.checksum,
+        registry_ref: vm.source_registry_ref.clone(),
+    }))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|error| Error::agent("hash pack", error.to_string()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|error| Error::agent("hash pack", error.to_string()))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The locally cached `.smolmachine` a checkpoint's layers came from, found by
+/// its content digest so no registry is involved when this host has it.
+pub fn cached_checkpoint_pack(packed: &CheckpointPackedLayers) -> Option<PathBuf> {
+    let cache = smolvm_registry::BlobCache::open_default().ok()?;
+    cache.get(&format!("sha256:{}", packed.artifact_sha256))
+}
+
+/// Confirm that `sidecar` is the pack a checkpoint was captured with.
+pub fn verify_checkpoint_pack(sidecar: &Path, packed: &CheckpointPackedLayers) -> Result<()> {
+    let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
+        .map_err(|error| Error::agent("read pack footer", error.to_string()))?;
+    if footer.checksum != packed.footer_checksum {
+        return Err(Error::agent(
+            "restore checkpoint",
+            format!(
+                "pack {} is not the one this checkpoint was captured with",
+                sidecar.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Serve a pack's image layers to a machine: extracted once per host into the
+/// shared store where it is available, otherwise into the machine's own
+/// directory. Used both when a machine is created from a pack and when a
+/// checkpoint of one is restored.
+pub fn materialize_pack_layers(name: &str, sidecar: &Path) -> Result<()> {
+    let cache_dir = crate::agent::machine_layers_cache_dir(name);
+    let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
+        .map_err(|error| Error::agent("read sidecar footer", error.to_string()))?;
+    if smolvm_pack::extract::shared_extract_enabled() {
+        #[cfg(target_os = "linux")]
+        {
+            crate::artifact_cache::materialize_shared_pack_lease(
+                sidecar, &footer, &cache_dir, false,
+            )
+            .map_err(|error| Error::agent("extract sidecar (shared)", error.to_string()))?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        unreachable!("shared pack extraction is Linux-only")
+    }
+    smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+    match std::fs::remove_dir_all(&cache_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(Error::agent("clear packed layers cache", error.to_string())),
+    }
+    smolvm_pack::extract::extract_sidecar(sidecar, &cache_dir, &footer, false, false)
+        .map_err(|error| Error::agent("extract sidecar", error.to_string()))
+}
+
+/// After a checkpoint is installed, mount the pack its image layers came from,
+/// using this host's copy. Returns the sidecar and registry reference to record
+/// on the restored machine, or `None` when the checkpoint mounts no pack.
+pub fn attach_cached_checkpoint_pack(
+    name: &str,
+    checkpoint: &PortableCheckpointManifest,
+) -> Result<Option<(String, Option<String>)>> {
+    let Some(packed) = &checkpoint.packed_layers else {
+        return Ok(None);
+    };
+    let sidecar = cached_checkpoint_pack(packed).ok_or_else(|| {
+        let source = packed
+            .registry_ref
+            .as_deref()
+            .map(|reference| format!(" ({reference})"))
+            .unwrap_or_default();
+        Error::agent(
+            "restore checkpoint",
+            format!(
+                "this checkpoint mounts image layers from pack sha256:{}{source}, which this \
+                 host does not have; pull that pack first",
+                packed.artifact_sha256
+            ),
+        )
+    })?;
+    verify_checkpoint_pack(&sidecar, packed)?;
+    materialize_pack_layers(name, &sidecar)?;
+    Ok(Some((
+        sidecar.to_string_lossy().into_owned(),
+        packed.registry_ref.clone(),
+    )))
+}
+
 /// Reject host-bound device state that cannot yet be resumed from an artifact.
 pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
     let mut unsupported = Vec::new();
@@ -1963,8 +2143,11 @@ pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
     if !vm.secret_refs.is_empty() {
         unsupported.push("host secret references");
     }
-    if vm.source_smolmachine.is_some()
-        || vm
+    // A `.smolmachine` source is recorded in the checkpoint and attached again
+    // on restore. Layers found only under a host path named by the image are
+    // not, so they stay unsupported.
+    if vm.source_smolmachine.is_none()
+        && vm
             .image
             .as_deref()
             .and_then(crate::data::image_source::packed_layers_dir_for_ref)
@@ -2427,6 +2610,21 @@ fn describe_sparse_asset(path: &Path, relative_path: &str) -> Result<CheckpointA
     })
 }
 
+/// Bound a RAM image by configured guest RAM and the devices' mapped windows.
+/// Capture and restore must use the same bound for packed-layer machines.
+fn max_checkpoint_memory_image(memory_mib: u32, packed_layers: bool) -> Result<u64> {
+    let packed_layers_window = if packed_layers {
+        crate::agent::virtiofs::packed_layers_dax_window()
+    } else {
+        0
+    };
+    u64::from(memory_mib)
+        .checked_mul(1024 * 1024)
+        .and_then(|bytes| bytes.checked_add(FIXED_MEMORY_OVERHEAD_BYTES))
+        .and_then(|bytes| bytes.checked_add(packed_layers_window))
+        .ok_or_else(|| Error::agent("checkpoint memory", "memory size overflow"))
+}
+
 /// Validate that a checkpoint may be restored by this host and runtime.
 pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
     let required = match checkpoint.payload {
@@ -2463,7 +2661,12 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
             ),
         ));
     }
-    if checkpoint.device_profile != DEVICE_PROFILE {
+    let expected_profile = if checkpoint.packed_layers.is_some() {
+        DEVICE_PROFILE_PACKED_LAYERS
+    } else {
+        DEVICE_PROFILE
+    };
+    if checkpoint.device_profile != expected_profile {
         return Err(Error::agent(
             "restore checkpoint",
             format!(
@@ -2538,13 +2741,8 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
     // for those non-configured mappings.
     const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
     const MAX_LAYOUT_BYTES: u64 = 1024 * 1024;
-    const FIXED_MEMORY_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-    let configured_memory = u64::from(checkpoint.memory_mib)
-        .checked_mul(1024 * 1024)
-        .ok_or_else(|| Error::agent("restore checkpoint", "memory size overflow"))?;
-    let max_memory_image = configured_memory
-        .checked_add(FIXED_MEMORY_OVERHEAD_BYTES)
-        .ok_or_else(|| Error::agent("restore checkpoint", "memory size overflow"))?;
+    let max_memory_image =
+        max_checkpoint_memory_image(checkpoint.memory_mib, checkpoint.packed_layers.is_some())?;
     if checkpoint.state.size == 0
         || checkpoint.state.size > MAX_STATE_BYTES
         || checkpoint.layout.size == 0
@@ -3738,6 +3936,7 @@ mod tests {
             ],
             workload: None,
             network: Some(CheckpointNetwork::default()),
+            packed_layers: None,
             lineage: None,
             payload: Default::default(),
             history: Vec::new(),
@@ -4366,15 +4565,53 @@ mod tests {
         let error = validate_capture_profile(&record).unwrap_err().to_string();
         assert!(error.contains("host mounts"), "{error}");
 
+        // A pack source is recorded in the checkpoint and reattached on restore.
         record.mounts.clear();
         record.source_smolmachine = Some("/tmp/source.smolmachine".to_string());
-        let error = validate_capture_profile(&record).unwrap_err().to_string();
-        assert!(error.contains("host-backed image layers"), "{error}");
+        validate_capture_profile(&record).unwrap();
     }
 
     #[test]
-    fn unreleased_checkpoint_versions_are_rejected() {
-        let mut metadata = PortableCheckpointManifest {
+    fn a_packed_layers_checkpoint_needs_its_own_device_profile() {
+        let packed = CheckpointPackedLayers {
+            artifact_sha256: "ab".repeat(32),
+            footer_checksum: 7,
+            registry_ref: Some("registry.example/library/alpine:latest".to_string()),
+        };
+        let mut metadata = minimal_checkpoint_manifest();
+        validate_compatibility(&metadata).unwrap();
+
+        // The pack without the profile that says a restore must reattach it.
+        metadata.packed_layers = Some(packed.clone());
+        let error = validate_compatibility(&metadata).unwrap_err().to_string();
+        assert!(error.contains("device profile"), "{error}");
+
+        metadata.device_profile = DEVICE_PROFILE_PACKED_LAYERS.to_string();
+        validate_compatibility(&metadata).unwrap();
+        metadata.memory.size = max_checkpoint_memory_image(metadata.memory_mib, true).unwrap();
+        validate_compatibility(&metadata).unwrap();
+        metadata.memory.size += 1;
+        assert!(validate_compatibility(&metadata).is_err());
+        metadata.memory.size = 1;
+
+        // And the profile without a pack to reattach.
+        metadata.packed_layers = None;
+        let error = validate_compatibility(&metadata).unwrap_err().to_string();
+        assert!(error.contains("device profile"), "{error}");
+    }
+
+    #[test]
+    fn checkpoints_without_a_pack_still_read_and_write_the_same() {
+        let metadata = minimal_checkpoint_manifest();
+        let json = serde_json::to_value(&metadata).unwrap();
+        assert!(json.get("packed_layers").is_none());
+        let back: PortableCheckpointManifest = serde_json::from_value(json).unwrap();
+        assert_eq!(back.packed_layers, None);
+    }
+
+    /// The smallest manifest this host accepts, for tests of the validator.
+    fn minimal_checkpoint_manifest() -> PortableCheckpointManifest {
+        PortableCheckpointManifest {
             version: FORMAT_VERSION,
             runtime_abi: RUNTIME_ABI.to_string(),
             host_platform: crate::platform::Platform::current()
@@ -4404,10 +4641,16 @@ mod tests {
             disks: Vec::new(),
             workload: None,
             network: Some(CheckpointNetwork::default()),
+            packed_layers: None,
             lineage: None,
             payload: Default::default(),
             history: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn unreleased_checkpoint_versions_are_rejected() {
+        let mut metadata = minimal_checkpoint_manifest();
         validate_compatibility(&metadata).unwrap();
         metadata.version = FORMAT_VERSION - 1;
         assert!(validate_compatibility(&metadata).is_err());
