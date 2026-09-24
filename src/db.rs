@@ -2764,6 +2764,7 @@ mod tests {
             auto_admission: false,
             cuda_device_ordinal: Some(0),
             share_weights: true,
+            freeze_source: false,
             ready_timeout_secs: 30,
             lease_ttl_secs: 60,
             created_at: 100,

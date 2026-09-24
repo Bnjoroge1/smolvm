@@ -903,9 +903,15 @@ pub struct ForkVmOptions<'a> {
     pub fork_secrets: &'a BTreeMap<String, SecretRef>,
     pub wait_ready: Option<std::time::Duration>,
     pub hold: bool,
+    pub freeze_source: bool,
 }
 
 pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm::Result<()> {
+    let source_policy = if options.freeze_source {
+        smolvm::agent::fork::ForkSourcePolicy::Freeze
+    } else {
+        smolvm::agent::fork::ForkSourcePolicy::PlatformDefault
+    };
     let db = SmolvmDb::open()?;
     let _source_lock = smolvm::agent::fork::lock_fork_source(golden)?;
 
@@ -936,11 +942,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     // Freeze + snapshot the golden, register the clone (CoW disks + DB record).
     // The launch-agnostic mechanics live in the lib (`agent::fork`) so the CLI
     // and the serve API share one implementation.
-    if smolvm::agent::fork::fork_continue_enabled() {
-        eprintln!("Checkpointing '{golden}' while keeping it running...");
-    } else {
-        eprintln!("Freezing source '{golden}' as branch base...");
-    }
+    eprintln!("Preparing branch from '{golden}'...");
     let prep = if options.hold {
         smolvm::agent::fork::prepare_held_fork(
             &db,
@@ -949,6 +951,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
             options.pinned_ports,
             options.fork_env,
             options.fork_secrets,
+            source_policy,
         )?
     } else {
         smolvm::agent::fork::prepare_fork(
@@ -959,6 +962,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
             options.clone_forkable,
             options.fork_env,
             options.fork_secrets,
+            source_policy,
         )?
     };
     for (golden_host, guest, clone_host) in &prep.port_remaps {
@@ -971,6 +975,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
         }
     }
 
+    let prep_source_continues = prep.source_continues;
     let snapshot_dir = prep.snapshot_dir.clone();
     if let Err(error) = boot_prepared_fork(
         &db,
@@ -995,7 +1000,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
             "Branched '{golden}' -> held slot '{clone}'. Release it with \
              `smolvm machine branch-release --name {clone}`."
         );
-    } else if smolvm::agent::fork::fork_continue_enabled() {
+    } else if prep_source_continues {
         eprintln!("Branched '{golden}' -> '{clone}'. Source continues running.");
     } else {
         eprintln!(
@@ -1016,6 +1021,7 @@ pub struct ForkBatchOptions<'a> {
     pub wait_ready: Option<std::time::Duration>,
     pub parallel: usize,
     pub hold: bool,
+    pub freeze_source: bool,
     /// Wait this long for each released child to run `smolvm-worker-ready`,
     /// tearing the batch down if one never does.
     pub worker_ready: Option<std::time::Duration>,
@@ -1032,8 +1038,14 @@ pub fn fork_vm_batch(
         wait_ready,
         parallel,
         hold,
+        freeze_source,
         worker_ready,
     } = options;
+    let source_policy = if freeze_source {
+        smolvm::agent::fork::ForkSourcePolicy::Freeze
+    } else {
+        smolvm::agent::fork::ForkSourcePolicy::PlatformDefault
+    };
     let db = SmolvmDb::open()?;
     let _source_lock = smolvm::agent::fork::lock_fork_source(golden)?;
 
@@ -1072,18 +1084,12 @@ pub fn fork_vm_batch(
             hold,
         })
         .collect();
-    if smolvm::agent::fork::fork_continue_enabled() {
-        eprintln!(
-            "Checkpointing '{golden}' once for {} clones while keeping it running...",
-            clones.len()
-        );
-    } else {
-        eprintln!(
-            "Freezing source '{golden}' once for {} children...",
-            clones.len()
-        );
-    }
-    let prepared = smolvm::agent::fork::prepare_forks(&db, golden, &specs)?;
+    eprintln!(
+        "Preparing one checkpoint for {} children from '{golden}'...",
+        clones.len()
+    );
+    let prepared = smolvm::agent::fork::prepare_forks(&db, golden, &specs, source_policy)?;
+    let source_continues = prepared[0].source_continues;
     let snapshot_dir = prepared[0].snapshot_dir.clone();
     let all_names: Vec<String> = clones.iter().map(|(name, _)| name.clone()).collect();
     let jobs: Vec<_> = prepared
@@ -1212,6 +1218,11 @@ pub fn fork_vm_batch(
         return retain_failed_fork(golden, &snapshot_dir, error);
     }
 
+    if source_continues {
+        eprintln!("Source '{golden}' continues running.");
+    } else {
+        eprintln!("Source '{golden}' stays frozen as the branch base.");
+    }
     if hold {
         eprintln!(
             "Provisioned {} held branch {} from '{golden}' with one checkpoint.",

@@ -97,6 +97,18 @@ smolvm machine start --name source --branchable
 smolvm machine branch --from source --name child          # checkpoints the source wherever it is
 ```
 
+Use `--freeze-source` when many independent children should branch from the
+same point. The source stays paused and later branches reuse its checkpoint,
+so its disk overlay does not gain another backing layer for each branch. The
+source cannot run `machine exec` while frozen. The flag works with both single
+and batch branches. The HTTP branch request and automatic pool creation request
+accept `"freezeSource": true`; a pool retains this setting for refills.
+
+```bash
+smolvm machine branch --from source --name child --freeze-source
+smolvm machine branch --from source --name child-2  # reuses the frozen checkpoint
+```
+
 To fan out many children from one checkpoint, the source's workload marks the
 point to take it by running `smolvm-branch-ready` once its setup is done, and
 names the program each child should run after it. The helper blocks in the
