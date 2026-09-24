@@ -443,6 +443,14 @@ fn fork_base_already_paused(status: &str) -> bool {
     status.trim() == "OK paused"
 }
 
+fn parse_fork_continue_override(val: &str) -> Option<bool> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => Some(false),
+        "1" | "true" | "on" | "yes" => Some(true),
+        _ => None,
+    }
+}
+
 /// Linux/KVM and macOS/HVF can atomically checkpoint a fork generation and
 /// resume the source on private RAM and disk layers. Other hosts retain the
 /// established frozen fork-base behavior.
@@ -452,7 +460,20 @@ fn fork_base_already_paused(status: &str) -> bool {
 /// architecture of its own. Without it a branch left the source frozen, which
 /// is a different machine than the one the caller branched — and a frozen
 /// source cannot be exec'd, only stopped or deleted.
+///
+/// Operators can explicitly override the policy via `SMOLVM_BRANCH_CONTINUE`
+/// (or `SMOLVM_FORK_CONTINUE`), e.g. setting `0` or `false` to keep the
+/// source frozen as a reusable branch base, avoiding qcow2 backing chain
+/// growth on high-fanout pools.
 pub fn fork_continue_enabled() -> bool {
+    if let Ok(val) =
+        std::env::var("SMOLVM_BRANCH_CONTINUE").or_else(|_| std::env::var("SMOLVM_FORK_CONTINUE"))
+    {
+        if let Some(enabled) = parse_fork_continue_override(&val) {
+            return enabled;
+        }
+    }
+
     cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
@@ -4930,5 +4951,18 @@ mod tests {
             !torn_down.get(),
             "a successful rejuvenation must not tear the clone down"
         );
+    }
+
+    #[test]
+    fn fork_continue_override_parsing() {
+        for truthy in ["1", "true", "True", "TRUE", "on", "ON", "yes", "YES"] {
+            assert_eq!(parse_fork_continue_override(truthy), Some(true));
+        }
+        for falsy in ["0", "false", "False", "FALSE", "off", "OFF", "no", "NO"] {
+            assert_eq!(parse_fork_continue_override(falsy), Some(false));
+        }
+        for invalid in ["", "auto", "invalid", "2"] {
+            assert_eq!(parse_fork_continue_override(invalid), None);
+        }
     }
 }
