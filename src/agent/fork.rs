@@ -374,6 +374,12 @@ pub(crate) fn validate_checkpoint_agent(machine: &str) -> Result<()> {
 /// marker and blocks. Keeping the wait in the VM namespace avoids coupling the
 /// host to container logs, PIDs, or workload-specific files.
 pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
+    // A frozen source cannot answer guest-agent requests. Its retained
+    // checkpoint is validated when preparation reuses it below.
+    let status = control_socket_cmd(&control_socket_path(golden), "STATUS")?;
+    if fork_base_already_paused(&status) {
+        return Ok(());
+    }
     let mut client = branch_client(golden, "wait for forkpoint")?;
     match client
         .branchpoint_wait(timeout)
@@ -443,6 +449,15 @@ fn fork_base_already_paused(status: &str) -> bool {
     status.trim() == "OK paused"
 }
 
+fn policy_allows_snapshot_reuse(
+    source_policy: ForkSourcePolicy,
+    golden_was_paused: bool,
+    reuse_live_snapshot: bool,
+) -> bool {
+    (golden_was_paused || reuse_live_snapshot)
+        && (source_policy != ForkSourcePolicy::Freeze || golden_was_paused)
+}
+
 /// Linux/KVM and macOS/HVF can atomically checkpoint a fork generation and
 /// resume the source on private RAM and disk layers. Other hosts retain the
 /// established frozen fork-base behavior.
@@ -452,8 +467,26 @@ fn fork_base_already_paused(status: &str) -> bool {
 /// architecture of its own. Without it a branch left the source frozen, which
 /// is a different machine than the one the caller branched — and a frozen
 /// source cannot be exec'd, only stopped or deleted.
+///
 pub fn fork_continue_enabled() -> bool {
     cfg!(any(target_os = "linux", target_os = "macos"))
+}
+
+/// How a branch operation leaves its source machine after the checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ForkSourcePolicy {
+    /// Resume the source where the host supports it.
+    #[default]
+    PlatformDefault,
+    /// Retain the checkpoint and leave the source paused for repeated branches.
+    Freeze,
+}
+
+impl ForkSourcePolicy {
+    /// Whether this policy requests a running source after capture.
+    pub fn continues(self) -> bool {
+        self == Self::PlatformDefault && fork_continue_enabled()
+    }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1956,6 +1989,8 @@ pub struct PreparedFork {
     /// caller to log. Empty when the golden has no forwards. When ports were
     /// pinned, `golden_host == clone_host`.
     pub port_remaps: Vec<(u16, u16, u16)>,
+    /// Whether the source resumed after this checkpoint.
+    pub source_continues: bool,
 }
 
 /// A checkpoint that may be reused by a frozen source or an explicit pool
@@ -2006,6 +2041,7 @@ pub struct ForkSpec<'a> {
 /// On any failure after the clone record is inserted, the record and its data
 /// directory are cleaned up before returning the error, so a failed fork leaves
 /// no half-registered clone behind.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_fork(
     db: &SmolvmDb,
     golden: &str,
@@ -2014,6 +2050,7 @@ pub fn prepare_fork(
     clone_forkable: bool,
     fork_env: &[(String, String)],
     fork_secrets: &BTreeMap<String, crate::secrets::SecretRef>,
+    source_policy: ForkSourcePolicy,
 ) -> Result<PreparedFork> {
     let mut prepared = prepare_forks(
         db,
@@ -2026,6 +2063,7 @@ pub fn prepare_fork(
             fork_secrets,
             hold: false,
         }],
+        source_policy,
     )?;
     Ok(prepared.remove(0))
 }
@@ -2039,6 +2077,7 @@ pub fn prepare_held_fork(
     pinned_ports: &[(u16, u16)],
     fork_env: &[(String, String)],
     fork_secrets: &BTreeMap<String, crate::secrets::SecretRef>,
+    source_policy: ForkSourcePolicy,
 ) -> Result<PreparedFork> {
     let mut prepared = prepare_forks(
         db,
@@ -2051,6 +2090,7 @@ pub fn prepare_held_fork(
             fork_secrets,
             hold: true,
         }],
+        source_policy,
     )?;
     Ok(prepared.remove(0))
 }
@@ -2067,11 +2107,21 @@ pub fn prepare_forks(
     db: &SmolvmDb,
     golden: &str,
     specs: &[ForkSpec<'_>],
+    source_policy: ForkSourcePolicy,
 ) -> Result<Vec<PreparedFork>> {
     let retained = db
         .retained_fork_snapshot(golden)
         .map_err(|error| Error::agent("read retained fork checkpoint", error.to_string()))?;
-    Ok(prepare_forks_reusing(db, golden, specs, retained.as_ref(), true, false)?.forks)
+    Ok(prepare_forks_reusing(
+        db,
+        golden,
+        specs,
+        retained.as_ref(),
+        true,
+        false,
+        source_policy,
+    )?
+    .forks)
 }
 
 /// Prepare a batch, optionally reusing a proven checkpoint that still belongs
@@ -2084,6 +2134,7 @@ pub(crate) fn prepare_forks_reusing(
     retained: Option<&RetainedForkSnapshot>,
     persist_snapshot: bool,
     reuse_live_snapshot: bool,
+    source_policy: ForkSourcePolicy,
 ) -> Result<PreparedForkBatch> {
     let preparation_started = std::time::Instant::now();
     if specs.is_empty() {
@@ -2185,7 +2236,7 @@ pub(crate) fn prepare_forks_reusing(
     }
     let golden_was_paused = fork_base_already_paused(&status);
     tracing::info!(%golden, phase = "source_ready", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
-    let fork_continue = fork_continue_enabled();
+    let fork_continue = source_policy.continues();
     let userfaultfd_available = kernel_fault_userfaultfd_available();
     let requested_ram_mode = std::env::var("SMOLVM_BRANCH_RAM_MODE").ok();
     let live_ram_mode = fork_continue
@@ -2206,7 +2257,7 @@ pub(crate) fn prepare_forks_reusing(
         recover_uncommitted_generations(db, golden, &gdir, &snapshot_root)?;
     }
     let reusable = retained.filter(|snapshot| {
-        (golden_was_paused || reuse_live_snapshot)
+        policy_allows_snapshot_reuse(source_policy, golden_was_paused, reuse_live_snapshot)
             && retained_snapshot_is_reusable(
                 &golden_rec,
                 golden_was_paused,
@@ -2762,6 +2813,7 @@ fn prepare_clone_from_snapshot(
             snapshot_dir: snapshot_dir.to_path_buf(),
             clone_record: clone_rec,
             port_remaps,
+            source_continues: fork_continue_snapshot(snapshot_dir),
         })
     })();
 
@@ -4930,5 +4982,33 @@ mod tests {
             !torn_down.get(),
             "a successful rejuvenation must not tear the clone down"
         );
+    }
+
+    #[test]
+    fn freeze_source_disables_source_resume() {
+        assert!(!ForkSourcePolicy::Freeze.continues());
+        assert_eq!(
+            ForkSourcePolicy::PlatformDefault.continues(),
+            fork_continue_enabled()
+        );
+    }
+
+    #[test]
+    fn freeze_source_captures_again_before_reusing_a_live_checkpoint() {
+        assert!(!policy_allows_snapshot_reuse(
+            ForkSourcePolicy::Freeze,
+            false,
+            true
+        ));
+        assert!(policy_allows_snapshot_reuse(
+            ForkSourcePolicy::Freeze,
+            true,
+            true
+        ));
+        assert!(policy_allows_snapshot_reuse(
+            ForkSourcePolicy::PlatformDefault,
+            false,
+            true
+        ));
     }
 }

@@ -342,6 +342,7 @@ pub(crate) fn fork_vm_with_options(
         clone_forkable,
         &[],
         &std::collections::BTreeMap::new(),
+        crate::agent::fork::ForkSourcePolicy::PlatformDefault,
     )?;
 
     boot_prepared_fork(db, clone, prep, share_weights, watch_parent, None)
@@ -462,7 +463,12 @@ pub fn fork_vm_batch(
             hold: false,
         })
         .collect();
-    let prepared = crate::agent::fork::prepare_forks(db, golden, &specs)?;
+    let prepared = crate::agent::fork::prepare_forks(
+        db,
+        golden,
+        &specs,
+        crate::agent::fork::ForkSourcePolicy::PlatformDefault,
+    )?;
     let width = parallel.max(1).min(prepared.len());
     let queue = std::sync::Mutex::new(std::collections::VecDeque::from(
         prepared.into_iter().enumerate().collect::<Vec<_>>(),

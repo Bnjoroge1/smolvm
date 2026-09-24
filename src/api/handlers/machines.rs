@@ -3194,6 +3194,11 @@ async fn fork_machine_transaction(
     let req_share_weights = req.share_weights;
     let req_forkable = req.forkable;
     let req_hold = req.hold;
+    let source_policy = if req.freeze_source {
+        crate::agent::fork::ForkSourcePolicy::Freeze
+    } else {
+        crate::agent::fork::ForkSourcePolicy::PlatformDefault
+    };
     let wait_ready = req.wait_ready || req_hold;
     let ready_timeout = std::time::Duration::from_secs(req.ready_timeout_secs.unwrap_or(240));
     let fork_env = crate::util::parse_env_list(&req.env);
@@ -3295,7 +3300,13 @@ async fn fork_machine_transaction(
         tokio::task::spawn_blocking(move || {
             if req_hold {
                 crate::agent::fork::prepare_held_fork(
-                    &db, &golden_b, &clone_b, &ports, &env, &secrets,
+                    &db,
+                    &golden_b,
+                    &clone_b,
+                    &ports,
+                    &env,
+                    &secrets,
+                    source_policy,
                 )
             } else {
                 crate::agent::fork::prepare_fork(
@@ -3306,6 +3317,7 @@ async fn fork_machine_transaction(
                     req_forkable,
                     &env,
                     &secrets,
+                    source_policy,
                 )
             }
         })
@@ -3342,6 +3354,7 @@ pub(crate) struct ForkHeldBatch {
     pub golden: String,
     pub clones: Vec<String>,
     pub share_weights: bool,
+    pub freeze_source: bool,
     pub ready_timeout: std::time::Duration,
     pub retained_snapshot: Option<crate::agent::fork::RetainedForkSnapshot>,
     pub boot_slots: Arc<tokio::sync::Semaphore>,
@@ -3358,11 +3371,17 @@ pub(crate) async fn fork_held_machines_inner(
         golden,
         clones,
         share_weights,
+        freeze_source,
         ready_timeout,
         retained_snapshot,
         boot_slots,
         mut snapshot_ready,
     } = batch;
+    let source_policy = if freeze_source {
+        crate::agent::fork::ForkSourcePolicy::Freeze
+    } else {
+        crate::agent::fork::ForkSourcePolicy::PlatformDefault
+    };
     if clones.is_empty() {
         return Ok(ForkBatchOutcome { retained_snapshot });
     }
@@ -3412,6 +3431,7 @@ pub(crate) async fn fork_held_machines_inner(
                 retained_snapshot.as_ref(),
                 true,
                 true,
+                source_policy,
             )
         })
         .await

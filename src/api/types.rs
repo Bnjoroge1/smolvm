@@ -1023,6 +1023,9 @@ pub struct ForkRequest {
     /// fork-release endpoint after assigning job-specific parameters.
     #[serde(default)]
     pub hold: bool,
+    /// Keep the source paused as a reusable branch base.
+    #[serde(default)]
+    pub freeze_source: bool,
     /// Maximum seconds to wait for the golden workload's forkpoint. Defaults
     /// to 240 when `waitReady` or `hold` is enabled.
     #[serde(default)]
@@ -1087,6 +1090,9 @@ pub struct CreateForkPoolRequest {
     /// Share immutable CUDA allocations with the golden and sibling workers.
     #[serde(default)]
     pub share_weights: bool,
+    /// Keep the source paused while this pool is replenished from its checkpoint.
+    #[serde(default)]
+    pub freeze_source: bool,
     /// Maximum seconds to wait for the golden workload forkpoint.
     #[serde(default)]
     pub ready_timeout_secs: Option<u64>,
@@ -1132,6 +1138,8 @@ pub struct ForkPoolInfo {
     pub golden: String,
     /// Configured clean-worker target.
     pub desired_ready: u32,
+    /// Whether this pool keeps its source paused for repeated branches.
+    pub freeze_source: bool,
     /// Optional simultaneous active-lease limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_active: Option<u32>,
@@ -1470,7 +1478,25 @@ mod registry_auth_tests {
         .unwrap();
         assert!(!request.wait_ready);
         assert!(!request.hold);
+        assert!(!request.freeze_source);
         assert_eq!(request.ready_timeout_secs, None);
+    }
+
+    #[test]
+    fn branch_and_pool_accept_freeze_source() {
+        let branch: ForkRequest = serde_json::from_value(serde_json::json!({
+            "name": "child-1", "freezeSource": true
+        }))
+        .unwrap();
+        assert!(branch.freeze_source);
+        assert_eq!(serde_json::to_value(branch).unwrap()["freezeSource"], true);
+
+        let pool: CreateForkPoolRequest = serde_json::from_value(serde_json::json!({
+            "name": "workers", "source": "base", "desiredReady": 2,
+            "freezeSource": true
+        }))
+        .unwrap();
+        assert!(pool.freeze_source);
     }
 
     #[test]

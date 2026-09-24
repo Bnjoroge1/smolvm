@@ -548,6 +548,7 @@ impl ForkPoolController {
                 golden: pool.golden.clone(),
                 clones: machines.clone(),
                 share_weights: pool.share_weights,
+                freeze_source: pool.freeze_source,
                 ready_timeout: Duration::from_secs(pool.ready_timeout_secs),
                 retained_snapshot,
                 boot_slots,

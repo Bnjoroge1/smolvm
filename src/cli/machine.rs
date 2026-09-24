@@ -2620,6 +2620,21 @@ mod tests {
         assert_eq!(single.clone.as_deref(), Some("worker"));
         assert_eq!(single.count.get(), 1);
         assert!(!single.wait_ready);
+        assert!(!single.freeze_source);
+
+        let frozen = TestMachineCli::parse_from([
+            "machine",
+            "branch",
+            "--from",
+            "base",
+            "--name",
+            "worker",
+            "--freeze-source",
+        ]);
+        let MachineCmd::Branch(frozen) = frozen.command else {
+            panic!("expected machine branch command");
+        };
+        assert!(frozen.freeze_source);
 
         let batch = TestMachineCli::parse_from([
             "machine",
@@ -4429,6 +4444,11 @@ pub struct ForkCmd {
     #[arg(long)]
     pub hold: bool,
 
+    /// Leave the source paused as a reusable branch base. Subsequent branches
+    /// reuse its checkpoint without adding source disk layers.
+    #[arg(long)]
+    pub freeze_source: bool,
+
     /// Maximum time to wait for the source workload's branch boundary.
     #[arg(
         long,
@@ -4563,6 +4583,7 @@ impl ForkCmd {
                     fork_secrets: &fork_secrets,
                     wait_ready,
                     hold: self.hold,
+                    freeze_source: self.freeze_source,
                 },
             );
         }
@@ -4633,6 +4654,7 @@ impl ForkCmd {
                 wait_ready,
                 parallel: self.parallel.get() as usize,
                 hold: self.hold,
+                freeze_source: self.freeze_source,
                 worker_ready,
             },
         )
