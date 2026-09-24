@@ -2041,6 +2041,7 @@ pub struct ForkSpec<'a> {
 /// On any failure after the clone record is inserted, the record and its data
 /// directory are cleaned up before returning the error, so a failed fork leaves
 /// no half-registered clone behind.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_fork(
     db: &SmolvmDb,
     golden: &str,
