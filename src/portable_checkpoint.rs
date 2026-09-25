@@ -1041,7 +1041,58 @@ pub(crate) fn capture_to_path_with_source_release(
         release_source,
         false,
         |_| Ok(()),
+        None,
     )
+}
+
+/// Retention of a capture's unpacked state in the node's prepared cache, handed
+/// back to the caller instead of run inline.
+///
+/// Retaining verifies and fsyncs the whole unpacked state, which costs about as
+/// much as the capture itself, and nothing waits on it: a restore that arrives
+/// first reads the packed artifact instead. The caller runs it once it has
+/// replied, while it still owns the artifact.
+pub(crate) struct DeferredRetain(Box<dyn FnOnce(&Path) + Send>);
+
+impl DeferredRetain {
+    /// Retain against `artifact`, which must still be the capture's output.
+    pub(crate) fn run(self, artifact: &Path) {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // One at a time, so bursts of captures do not stack multi-gigabyte fsyncs.
+        let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+        (self.0)(artifact)
+    }
+}
+
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
+/// [`capture_to_path_with_source_release`], leaving prepared-cache retention
+/// to the caller.
+pub(crate) fn capture_to_path_deferring_retention(
+    name: &str,
+    output: &Path,
+    options: &CaptureOptions,
+    history: usize,
+    release_source: impl FnOnce(),
+) -> Result<(CaptureResult, Option<DeferredRetain>)> {
+    let mut deferred = None;
+    let result = capture_with_completion(
+        name,
+        output,
+        options,
+        history,
+        release_source,
+        false,
+        |_| Ok(()),
+        Some(&mut deferred),
+    )?;
+    Ok((result, deferred))
 }
 
 /// Durable lifecycle boundaries for an owner coordinating a pause.
@@ -1069,9 +1120,11 @@ pub fn capture_and_stop_to_path(
         || {},
         true,
         publish_resume_point,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_with_completion(
     name: &str,
     output: &Path,
@@ -1080,6 +1133,7 @@ fn capture_with_completion(
     release_source: impl FnOnce(),
     stop_after_capture: bool,
     mut publish_resume_point: impl FnMut(PauseCaptureStage) -> Result<()>,
+    defer_retain: Option<&mut Option<DeferredRetain>>,
 ) -> Result<CaptureResult> {
     let started = std::time::Instant::now();
     let mut phase = started;
@@ -1229,7 +1283,6 @@ fn capture_with_completion(
         && smolvm_pack::extract::shared_extract_enabled();
     let sparse_capable = cfg!(all(target_os = "linux", target_arch = "x86_64"))
         && options.store_dir.is_none()
-        && !retain
         && crate::agent::fork::control_socket_cmd(&control, "SAVE_SPARSE_CAPABILITIES")?.trim()
             == "OK sparse-stream-v1 ownership-v1";
     let max_memory_image = max_checkpoint_memory_image(vm.mem, vm.source_smolmachine.is_some())?;
@@ -1326,6 +1379,16 @@ fn capture_with_completion(
         ),
         None => None,
     };
+    // Retention needs the unpacked RAM image the streamed path never writes, so
+    // the stream writes it too: only the pages in use, beside the staging tree
+    // so packing does not pick it up. Sparse, it is a fraction of full RAM.
+    let prepared_memory = temp_dir.path().join("prepared-memory.bin");
+    if let Some(stream) = streamed_memory.as_mut().filter(|_| retain) {
+        match create_private_file(&prepared_memory) {
+            Ok(file) => stream.copy_memory_to(file),
+            Err(error) => tracing::warn!(%error, "streamed checkpoint will not be retained"),
+        }
+    }
 
     let mut stored = stored;
     let stored_memory = if let Some((_, writer)) = stored.as_mut() {
@@ -1643,6 +1706,14 @@ fn capture_with_completion(
         packer.pack_artifact(output).map(|info| (info, None))
     }
     .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
+    // A streamed capture is retainable only once its RAM copy is complete.
+    #[cfg(target_os = "linux")]
+    let retain = retain
+        && streamed_memory
+            .as_ref()
+            .is_none_or(|stream| stream.memory_copied());
+    #[cfg(target_os = "linux")]
+    let streamed = streamed_memory.is_some();
     if streamed_memory.is_some() {
         pause.prepared_save = None;
         #[cfg(target_os = "linux")]
@@ -1651,23 +1722,36 @@ fn capture_with_completion(
     log_phase(name, "capture_pack", &mut phase);
     #[cfg(not(target_os = "linux"))]
     let _ = identity;
+    #[cfg(not(target_os = "linux"))]
+    let _ = defer_retain;
     #[cfg(target_os = "linux")]
-    if options
-        .prepared_cache_budget_bytes
-        .is_some_and(|bytes| bytes > 0)
-        && smolvm_pack::extract::shared_extract_enabled()
-    {
-        if let Err(error) = crate::artifact_cache::retain_prepared_checkpoint_with_identity(
-            output,
-            &staging_dir,
-            identity.as_ref(),
-        ) {
-            tracing::warn!(%error, "prepared checkpoint unavailable; durable artifact remains usable");
-        }
-        if let Err(error) = crate::artifact_cache::prune_prepared_checkpoints(
-            options.prepared_cache_budget_bytes.unwrap_or(0),
-        ) {
-            tracing::warn!(%error, "could not prune prepared checkpoints");
+    if retain {
+        let budget = options.prepared_cache_budget_bytes.unwrap_or(0);
+        let job = DeferredRetain(Box::new(move |artifact: &Path| {
+            if streamed {
+                if let Err(error) =
+                    std::fs::rename(&prepared_memory, snapshot_dir.join("memory.bin"))
+                {
+                    tracing::warn!(%error, "prepared checkpoint unavailable; durable artifact remains usable");
+                    return;
+                }
+            }
+            if let Err(error) = crate::artifact_cache::retain_prepared_checkpoint_with_identity(
+                artifact,
+                &staging_dir,
+                identity.as_ref(),
+            ) {
+                tracing::warn!(%error, "prepared checkpoint unavailable; durable artifact remains usable");
+            }
+            if let Err(error) = crate::artifact_cache::prune_prepared_checkpoints(budget) {
+                tracing::warn!(%error, "could not prune prepared checkpoints");
+            }
+            // The staging tree is consumed by retention or discarded here.
+            drop(temp_dir);
+        }));
+        match defer_retain {
+            Some(slot) => *slot = Some(job),
+            None => job.run(output),
         }
         log_phase(name, "capture_retain_prepared", &mut phase);
     }
