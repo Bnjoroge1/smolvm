@@ -170,3 +170,38 @@ the workload the *ability to use* the value at named hosts and nothing else.
 Use secrets injection for values a program must read (a database URL it
 parses); use credential bindings for bearer tokens and API keys that only ever
 appear in a request header.
+
+## External host interceptor
+
+A local orchestrator can own interception instead of using the built-in
+credential resolver:
+
+```sh
+smolvm machine create --name worker --net --image alpine:3.20
+SMOLVM_INTERCEPTOR_TOKEN="$TOKEN" smolvm machine start --name worker \
+  --egress-interceptor 127.0.0.1:43123
+```
+
+The address must be loopback; IPv6 uses `[::1]:43123`. `TOKEN` is the same
+random 32-byte token held by the interceptor, encoded as 64 hexadecimal
+digits. It is read from the host environment, never forwarded to the guest
+or saved in the machine definition. Supply the address and token again after
+stopping the machine. A running machine must be stopped before changing the
+endpoint.
+
+This selects `virtio-net` and redirects every admitted outbound TCP connection,
+including non-HTTPS ports and IPv6, to the service. The machine's egress
+allowlist still applies before interception. Gateway DNS remains host-managed;
+other outbound UDP and ICMP are blocked. An unavailable interceptor, rejected
+connection, or failed handshake never falls back to dialing the destination.
+TSI, named/pod networks, checkpoint/branch launches, and simultaneous built-in
+credential bindings are rejected.
+
+The service implements the existing handshake in
+[`smolvm-protocol::intercept`](../crates/smolvm-protocol/src/intercept.rs):
+validate the per-launch token and original destination, send a one-byte
+connection verdict, then handle the stream. Use a different token for each
+machine launch to associate connections with its policy. The service owns
+TLS handling and credential resolution; the caller installs its CA and
+placeholder environment variables in the guest. No `HTTPS_PROXY` setting is
+needed.

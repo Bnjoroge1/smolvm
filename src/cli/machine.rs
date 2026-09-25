@@ -15,7 +15,7 @@ use crate::cli::parsers::{
     mounts_to_virtiofs_bindings, parse_cidr, parse_duration, parse_env_list, parse_image,
 };
 use crate::cli::vm_common::{self, DeleteVmOptions};
-use clap::{Args, Subcommand};
+use clap::{builder::TypedValueParser, Args, Subcommand};
 use sha2::{Digest, Sha256};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
 use smolvm::data::network::{PortMapping, PortMappingSpec, MAX_PORT_MAPPINGS};
@@ -2829,6 +2829,29 @@ mod tests {
     }
 
     #[test]
+    fn external_interceptor_requires_a_named_start() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "start",
+            "--name",
+            "worker",
+            "--egress-interceptor",
+            "[::1]:43123",
+        ]);
+        let MachineCmd::Start(cmd) = cli.command else {
+            panic!("expected machine start command");
+        };
+        assert_eq!(cmd.egress_interceptor, Some("[::1]:43123".parse().unwrap()));
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "start",
+            "--egress-interceptor",
+            "[::1]:43123",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn block_io_defaults_to_unset_and_accepts_async() {
         let cli = TestMachineCli::parse_from(["machine", "create", "--name", "default"]);
         let MachineCmd::Create(cmd) = cli.command else {
@@ -4386,12 +4409,46 @@ pub struct StartCmd {
     #[arg(long = "no-workload", hide = true)]
     pub no_workload: bool,
 
+    /// Route outbound TCP through a host interceptor. Requires
+    /// SMOLVM_INTERCEPTOR_TOKEN (64 hex digits). Other outbound datagrams except DNS are denied.
+    #[arg(long, value_name = "ADDR", requires = "name")]
+    pub egress_interceptor: Option<std::net::SocketAddr>,
+
+    #[arg(
+        long,
+        env = "SMOLVM_INTERCEPTOR_TOKEN",
+        hide = true,
+        hide_env_values = true,
+        requires = "egress_interceptor",
+        value_parser = clap::builder::StringValueParser::new().map(smolvm::secrets::Secret::new)
+    )]
+    pub egress_interceptor_token: Option<smolvm::secrets::Secret>,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
 
 impl StartCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        let external_interceptor = self
+            .egress_interceptor
+            .map(|addr| {
+                let encoded = self.egress_interceptor_token.as_ref().ok_or_else(|| {
+                    smolvm::Error::config(
+                        "egress interceptor",
+                        "set SMOLVM_INTERCEPTOR_TOKEN to 64 random hex digits",
+                    )
+                })?;
+                let mut token = [0; smolvm_protocol::intercept::TOKEN_LEN];
+                if hex::decode_to_slice(encoded.expose(), &mut token).is_err() || token == [0; 32] {
+                    return Err(smolvm::Error::config(
+                        "egress interceptor",
+                        "SMOLVM_INTERCEPTOR_TOKEN must contain 64 hex digits and must not be all zeros",
+                    ));
+                }
+                Ok(smolvm_protocol::InterceptEndpoint { addr, token })
+            })
+            .transpose()?;
         let explicit_name = self.name.is_some();
         let name = self.name.unwrap_or_else(|| "default".to_string());
         let proxy = self.proxy_opts.resolved_proxy()?;
@@ -4412,7 +4469,10 @@ impl StartCmd {
             no_proxy.as_deref(),
             /* from_snapshot */ false,
             fork,
-            self.no_workload,
+            vm_common::StartOptions {
+                no_workload: self.no_workload,
+                external_interceptor,
+            },
         ) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
@@ -6044,7 +6104,7 @@ impl MonitorCmd {
                 None,
                 /* from_snapshot */ false,
                 vm_common::ForkLaunch::default(),
-                /* no_workload */ false,
+                vm_common::StartOptions::default(),
             )?;
         }
 
@@ -6228,7 +6288,7 @@ impl MonitorCmd {
                         None,
                         /* from_snapshot */ false,
                         vm_common::ForkLaunch::default(),
-                        /* no_workload */ false,
+                        vm_common::StartOptions::default(),
                     ) {
                         Ok(()) => {
                             println!("  machine restarted");
