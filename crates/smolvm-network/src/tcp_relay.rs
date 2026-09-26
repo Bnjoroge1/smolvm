@@ -72,7 +72,16 @@ pub struct TcpRelayTable {
     /// One authenticated smolvm-owned loopback service allowed through the
     /// otherwise-denied gateway address.
     host_service: Option<crate::GatewayHostService>,
+    /// Redirect selected streams after egress admits their real destination.
+    /// `None` relays every flow directly.
+    intercept: Option<crate::StreamInterception>,
 }
+
+/// Destination port whose guest flows go through the credential interceptor.
+pub const INTERCEPTED_PORT: u16 = 443;
+
+/// Upper bound on the interceptor's own connect to the destination.
+const INTERCEPT_VERDICT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Newly established guest connection ready for a host relay thread.
 ///
@@ -136,6 +145,12 @@ pub enum RelayTarget {
     Connect(SocketAddr),
     /// Use an already-accepted host `TcpStream` from a published port listener.
     Attached(TcpStream),
+    /// Dial the credential interceptor and announce the guest's real
+    /// destination in an authenticated preamble before relaying guest bytes.
+    Intercept {
+        endpoint: crate::InterceptEndpoint,
+        destination: SocketAddr,
+    },
 }
 
 /// Host relay termination state shared between the poll loop and the relay thread.
@@ -208,6 +223,33 @@ impl TcpRelayTable {
             egress,
             gateway_ips,
             host_service,
+            intercept: None,
+        }
+    }
+
+    /// Route selected guest streams through a host interceptor.
+    pub fn with_intercept(mut self, intercept: Option<crate::StreamInterception>) -> Self {
+        self.intercept = intercept;
+        self
+    }
+
+    /// Relay target for a guest-initiated flow that egress already admitted.
+    fn outbound_target(&self, destination: SocketAddr) -> RelayTarget {
+        match self.intercept {
+            Some(crate::StreamInterception::Https(endpoint))
+                if destination.port() == INTERCEPTED_PORT
+                    && !self.gateway_ips.contains(&destination.ip()) =>
+            {
+                RelayTarget::Intercept {
+                    endpoint,
+                    destination,
+                }
+            }
+            Some(crate::StreamInterception::AllTcp(endpoint)) => RelayTarget::Intercept {
+                endpoint,
+                destination,
+            },
+            _ => RelayTarget::Connect(self.host_connect_addr(destination)),
         }
     }
 
@@ -347,7 +389,7 @@ impl TcpRelayTable {
                 pending_proxy_endpoints: Some(PendingProxyEndpoints {
                     from_smoltcp: to_proxy_rx,
                     to_smoltcp: from_proxy_tx,
-                    relay_target: RelayTarget::Connect(self.host_connect_addr(destination)),
+                    relay_target: self.outbound_target(destination),
                 }),
                 relay_spawned: false,
                 buffered_guest_data: None,
@@ -761,6 +803,27 @@ fn tcp_relay_loop(
             );
             stream
         }
+        RelayTarget::Intercept {
+            endpoint,
+            destination,
+        } => {
+            virtio_net_log!(
+                "virtio-net: redirecting guest flow to credential interceptor destination={} interceptor={}",
+                destination,
+                endpoint.addr
+            );
+            // The preamble is written blocking, before any guest byte: it is a
+            // few dozen bytes to a loopback listener and must precede the TLS
+            // ClientHello the guest sends next.
+            let mut stream = TcpStream::connect(endpoint.addr)?;
+            endpoint.write_preamble(&mut stream, destination)?;
+            // The interceptor dials the destination before answering; a
+            // failure aborts the flow as a failed direct connect would.
+            stream.set_read_timeout(Some(INTERCEPT_VERDICT_TIMEOUT))?;
+            smolvm_protocol::intercept::read_verdict(&mut stream)?;
+            stream.set_read_timeout(None)?;
+            stream
+        }
     };
     stream.set_nonblocking(true)?;
 
@@ -1118,6 +1181,148 @@ mod tests {
 
         assert_eq!(relay_exit, RelayExitMode::Graceful);
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn intercept_target_announces_the_destination_before_guest_bytes() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = crate::InterceptEndpoint {
+            addr: listener.local_addr().unwrap(),
+            token: [0x5a; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+
+        let (from_smoltcp_tx, from_smoltcp_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (to_smoltcp_tx, to_smoltcp_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let wake_pipe = Arc::new(WakePipe::new());
+        let exit_state = RelayExitState::new();
+        from_smoltcp_tx.send(b"\x16\x03\x01hello".to_vec()).unwrap();
+        drop(from_smoltcp_tx);
+
+        let interceptor = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let announced = endpoint.read_preamble(&mut stream).unwrap();
+            stream
+                .write_all(&[smolvm_protocol::intercept::VERDICT_CONNECTED])
+                .unwrap();
+            let mut buf = [0u8; 64];
+            let n = stream.read(&mut buf).unwrap();
+            stream.write_all(b"ack").unwrap();
+            (announced, buf[..n].to_vec())
+        });
+
+        let relay_exit = tcp_relay_loop(
+            destination,
+            RelayTarget::Intercept {
+                endpoint,
+                destination,
+            },
+            from_smoltcp_rx,
+            to_smoltcp_tx,
+            wake_pipe,
+            &exit_state,
+        )
+        .unwrap();
+        assert_eq!(relay_exit, RelayExitMode::Graceful);
+        let (announced, first_bytes) = interceptor.join().unwrap();
+        assert_eq!(announced, destination);
+        assert_eq!(first_bytes, b"\x16\x03\x01hello");
+        assert_eq!(to_smoltcp_rx.recv().unwrap(), b"ack");
+    }
+
+    #[test]
+    fn only_https_flows_are_redirected_to_the_interceptor() {
+        let endpoint = crate::InterceptEndpoint {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            token: [0; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        let gateway = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
+        let table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gateway], None)
+            .with_intercept(Some(crate::StreamInterception::Https(endpoint)));
+        let https = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+        let http = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 80);
+        let gateway_https = SocketAddr::new(gateway, 443);
+        assert!(matches!(
+            table.outbound_target(https),
+            RelayTarget::Intercept { destination, .. } if destination == https
+        ));
+        assert!(matches!(table.outbound_target(http), RelayTarget::Connect(addr) if addr == http));
+        assert!(matches!(
+            table.outbound_target(gateway_https),
+            RelayTarget::Connect(addr) if addr.ip().is_loopback()
+        ));
+        let plain = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None);
+        assert!(
+            matches!(plain.outbound_target(https), RelayTarget::Connect(addr) if addr == https)
+        );
+    }
+
+    #[test]
+    fn external_interceptor_receives_all_tcp_destinations() {
+        let endpoint = crate::InterceptEndpoint {
+            addr: "127.0.0.1:1234".parse().unwrap(),
+            token: [1; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        let gateway = "100.96.0.1".parse().unwrap();
+        let table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gateway], None)
+            .with_intercept(Some(crate::StreamInterception::AllTcp(endpoint)));
+        for address in [
+            "192.0.2.1:80",
+            "192.0.2.1:443",
+            "192.0.2.1:22",
+            "[2001:db8::1]:8443",
+            "100.96.0.1:8080",
+        ] {
+            let requested = address.parse().unwrap();
+            assert!(matches!(table.outbound_target(requested),
+                RelayTarget::Intercept { endpoint: actual, destination }
+                    if actual == endpoint && destination == requested));
+        }
+    }
+
+    #[test]
+    fn interceptor_failure_never_connects_directly() {
+        use std::net::TcpListener;
+
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let destination = upstream.local_addr().unwrap();
+        for reject in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = crate::InterceptEndpoint {
+                addr: listener.local_addr().unwrap(),
+                token: [1; smolvm_protocol::intercept::TOKEN_LEN],
+            };
+            let interceptor = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert_eq!(endpoint.read_preamble(&mut stream).unwrap(), destination);
+                if reject {
+                    stream.write_all(&[111]).unwrap();
+                }
+            });
+            let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
+            sender.send(b"guest payload".to_vec()).unwrap();
+            let (reply, _receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
+            assert!(tcp_relay_loop(
+                destination,
+                RelayTarget::Intercept {
+                    endpoint,
+                    destination
+                },
+                receiver,
+                reply,
+                Arc::new(WakePipe::new()),
+                &RelayExitState::new(),
+            )
+            .is_err());
+            interceptor.join().unwrap();
+            assert_eq!(
+                upstream.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
     }
 
     #[test]

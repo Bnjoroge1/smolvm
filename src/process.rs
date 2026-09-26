@@ -768,6 +768,11 @@ fn build_seccomp_program(
         libc::SYS_listen, libc::SYS_accept, libc::SYS_sendto, libc::SYS_recvfrom,
         libc::SYS_sendmsg, libc::SYS_sendmmsg, libc::SYS_recvmsg, libc::SYS_setsockopt,
         libc::SYS_getsockopt, libc::SYS_shutdown,
+        // The credential interceptor runs in this process beside the network
+        // stack, and hyper writes HTTP responses to the guest with vectored
+        // writes. Without writev every intercepted HTTPS flow SIGSYS-kills the
+        // VMM under `enforce` (syscall 20 on x86_64).
+        libc::SYS_writev,
         // threads & synchronization (vCPU/worker threads, render-thread priority)
         libc::SYS_clone, libc::SYS_clone3, libc::SYS_futex, libc::SYS_set_robust_list,
         libc::SYS_set_tid_address, libc::SYS_rseq, libc::SYS_sched_yield,
@@ -808,6 +813,17 @@ fn build_seccomp_program(
         libc::SYS_fchmod, libc::SYS_fdatasync, libc::SYS_utimensat, libc::SYS_copy_file_range,
         libc::SYS_fsetxattr, libc::SYS_fremovexattr,
         libc::SYS_lgetxattr, libc::SYS_lsetxattr, libc::SYS_llistxattr, libc::SYS_lremovexattr,
+        // The PATH-following pair, which the fd/symlink variants above cannot
+        // stand in for. `user.containers.override_stat` is read and written
+        // through an `O_PATH` fd — which `f*xattr` rejects with EBADF — so
+        // passthrough.rs reaches it by its `/proc/self/fd/N` magic link
+        // (`read_override` / `write_override`). That link must be FOLLOWED to
+        // land on the real inode, so `l*xattr`, which would operate on the link
+        // itself, is equally unusable. Omitting these killed any guest whose
+        // PID 1 stats early and often — systemd never finished booting, dying on
+        // SIGSYS with syscall 191 under `enforce`. `list`/`remove` have no bare
+        // caller, so they stay out: this list is an allowlist, not a family.
+        libc::SYS_getxattr, libc::SYS_setxattr,
         // virtiofs scopes each request to the guest process's uid/gid before
         // touching the host fs (so DAC checks run as the guest user, not as a
         // root VMM) via per-thread setres{u,g}id — passthrough.rs `scoped_cred!`
@@ -820,6 +836,13 @@ fn build_seccomp_program(
         // VMM still can't escalate — the kernel enforces CAP_SETUID regardless,
         // so the syscall just EPERMs. Matches virtiofsd's own allowlist.
         libc::SYS_setresuid, libc::SYS_setresgid,
+        // The RAM generation worker (a fork of the VMM taken while a live
+        // snapshot is retained) reads device windows such as a virtio-fs DAX
+        // window through its own address space with process_vm_readv, because a
+        // DAX mapping can run past the end of its host file and a plain read of
+        // that page raises SIGBUS. Reading its own pid only: with per-VM uid
+        // isolation the only processes it could otherwise reach are its own VM's.
+        libc::SYS_process_vm_readv,
     ];
 
     // An async block ring is created with R_DISABLED, fixed-file-only and
@@ -857,8 +880,20 @@ fn build_seccomp_program(
         libc::SYS_inotify_init,
         libc::SYS_arch_prctl,
     ]);
+    // arm64 has no legacy `rename`/`unlink`/`mkdir`, only the `*at` forms, so each
+    // x86_64 legacy entry above needs its `*at` counterpart here. `renameat` was
+    // the one missing: glibc turns every rename(2) into `renameat` (38) on arm64,
+    // so a guest renaming a file through the virtiofs share had the VMM issue a
+    // syscall this list did not allow — logged on every ARM worker, and a killed
+    // VM under `enforce`, which is why the ARM fleet could not leave `audit`.
+    // `renameat2` does not cover it: it is a different syscall number.
     #[cfg(target_arch = "aarch64")]
-    allowed.extend_from_slice(&[libc::SYS_unlinkat, libc::SYS_renameat2, libc::SYS_mkdirat]);
+    allowed.extend_from_slice(&[
+        libc::SYS_unlinkat,
+        libc::SYS_renameat,
+        libc::SYS_renameat2,
+        libc::SYS_mkdirat,
+    ]);
 
     let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
         allowed.iter().map(|&nr| (nr, Vec::new())).collect();
@@ -1887,7 +1922,8 @@ pub fn is_alive(pid: Pid) -> bool {
         return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
     }
     // A CLI cannot waitpid() a VM owned by serve. An exited child still has
-    // a PID until that parent reaps it, but no workload or open files remain.
+    // a PID until that parent reaps it. A zombie leader can still have live
+    // worker threads holding sockets, so check the thread count as well.
     // Do not make cleanup depend on the parent's next supervisor tick.
     // Unreadable or malformed procfs data is not evidence of exit.
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -1897,11 +1933,16 @@ pub fn is_alive(pid: Pid) -> bool {
 
 #[cfg(target_os = "linux")]
 fn linux_stat_has_exited(stat: &str) -> bool {
-    matches!(
-        stat.rsplit_once(") ")
-            .and_then(|(_, fields)| fields.split_ascii_whitespace().next()),
-        Some("Z" | "X" | "x")
-    )
+    let Some((_, fields)) = stat.rsplit_once(") ") else {
+        return false;
+    };
+    let mut fields = fields.split_ascii_whitespace();
+    if !matches!(fields.next(), Some("Z" | "X" | "x")) {
+        return false;
+    }
+    // num_threads is field 20, sixteen fields after ppid (field 4).
+    // Missing or malformed metadata is not proof that the group has exited.
+    fields.nth(16).and_then(|count| count.parse::<u64>().ok()) == Some(1)
 }
 
 /// Check if a process is alive (Windows).
@@ -3374,7 +3415,7 @@ mod tests {
     fn exited_state_requires_a_complete_procfs_state_field() {
         for state in ["Z", "X", "x"] {
             assert!(linux_stat_has_exited(&format!(
-                "123 (worker) {state} 1 2 3"
+                "123 (worker) {state} 1 2 3 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0"
             )));
         }
         for stat in [
@@ -3383,6 +3424,7 @@ mod tests {
             "123 (worker) T 1 2 3",
             "123 (name with ) Z inside) S 1 2 3",
             "123 (worker) Zombie 1 2 3",
+            "123 (worker) Z 1 2 3",
             "123 (worker) ",
             "unreadable",
         ] {
@@ -3390,6 +3432,94 @@ mod tests {
         }
         assert!(!is_alive(0));
         assert!(!is_alive(-1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_leader_fixture() {
+        let Some(path) = std::env::var_os("SMOLVM_TEST_EXITED_LEADER") else {
+            return;
+        };
+        extern "C" fn exit_thread(_: libc::c_int) {
+            unsafe { libc::syscall(libc::SYS_exit, 0) };
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let pid = unsafe { libc::getpid() };
+        // Exit only the subprocess's harness main thread. This test thread
+        // keeps the listener alive until the parent closes stdin.
+        unsafe {
+            libc::signal(
+                libc::SIGUSR1,
+                exit_thread as *const () as libc::sighandler_t,
+            );
+            libc::syscall(libc::SYS_tgkill, pid, pid, libc::SIGUSR1);
+        }
+        std::fs::write(path, listener.local_addr().unwrap().to_string()).unwrap();
+        let _ = std::io::Read::read_exact(&mut std::io::stdin(), &mut [0]);
+        unsafe { libc::_exit(0) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_worker_keeps_process_alive_after_leader_exit() {
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                drop(self.0.stdin.take());
+                let _ = self.0.wait();
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let fixture = Fixture(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::exited_leader_fixture",
+                    "--nocapture",
+                ])
+                .env("SMOLVM_TEST_EXITED_LEADER", &ready)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = fixture.0.id() as Pid;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            if ready.exists() && stat.rsplit_once(") ").unwrap().1.starts_with("Z ") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "leader did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let address = std::fs::read_to_string(ready).unwrap();
+        assert!(
+            std::net::TcpListener::bind(&address).is_err(),
+            "worker owns port"
+        );
+        assert!(
+            is_alive(pid),
+            "stop must wait for workers, not just the leader"
+        );
+        assert!(try_wait(pid).is_none());
+        drop(fixture);
+        assert!(std::net::TcpListener::bind(address).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_leader_with_live_threads_is_not_an_exited_process() {
+        // /proc/PID/stat fields 3 (state) and 20 (num_threads). A group
+        // leader can exit before workers release the shared socket table.
+        for state in ["Z", "X", "x"] {
+            for threads in ["2", "64"] {
+                let stat =
+                    format!("123 (worker) {state} 1 2 3 0 0 0 0 0 0 0 0 0 0 0 20 0 {threads} 0");
+                assert!(!linux_stat_has_exited(&stat), "{stat}");
+            }
+        }
     }
 
     #[test]
@@ -3576,6 +3706,151 @@ mod tests {
             assert!(
                 libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
                 "guardian chmod should survive seccomp, status={status:#x}"
+            );
+        }
+    }
+
+    /// arm64's rename path. glibc implements rename(2) as `renameat` there, and
+    /// the VMM renames files whenever a guest does through virtiofs, so a missing
+    /// entry killed ARM VMs under `enforce`. Performs a REAL rename through the
+    /// filter: the child must survive AND the file must actually have moved,
+    /// which also proves the allowed call is the one that did the work.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn seccomp_allows_renameat_on_aarch64() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let from = dir.path().join("before");
+        let to = dir.path().join("after");
+        std::fs::write(&from, b"x").expect("seed file");
+        let from_c = std::ffi::CString::new(from.as_os_str().as_encoded_bytes()).unwrap();
+        let to_c = std::ffi::CString::new(to.as_os_str().as_encoded_bytes()).unwrap();
+        let program = build_seccomp_program(true, false).expect("build seccomp program");
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                let rc = libc::syscall(
+                    libc::SYS_renameat,
+                    libc::AT_FDCWD,
+                    from_c.as_ptr(),
+                    libc::AT_FDCWD,
+                    to_c.as_ptr(),
+                );
+                libc::_exit(if rc == 0 { 0 } else { 3 });
+            }
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            assert!(
+                !(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS),
+                "renameat must not be killed by the filter on aarch64"
+            );
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "renameat should succeed under the filter, status={status:#x}"
+            );
+        }
+        assert!(
+            to.exists() && !from.exists(),
+            "the rename should actually have happened"
+        );
+    }
+
+    /// The converse of the test above: a syscall the VMM legitimately issues must
+    /// SURVIVE `enforce`. `getxattr` is the regression that motivated this —
+    /// virtiofs reads `user.containers.override_stat` through an `O_PATH` fd's
+    /// `/proc/self/fd` link, so it must use the path-following variant, and its
+    /// absence killed every systemd guest with SIGSYS mid-boot. The child exits 0
+    /// only if it ran the syscall and lived; the filter killing it yields SIGSYS
+    /// instead, which is the failure this pins.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn seccomp_allows_path_following_xattr_syscalls() {
+        let program = build_seccomp_program(true, false).expect("build seccomp program");
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                // Both are expected to FAIL (no such xattr) — what matters is
+                // that the kernel returns an error instead of raising SIGSYS.
+                let path = c"/proc/self/exe";
+                let name = c"user.containers.override_stat";
+                let mut buf = [0u8; 64];
+                libc::syscall(
+                    libc::SYS_getxattr,
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                );
+                libc::syscall(
+                    libc::SYS_setxattr,
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    buf.as_ptr(),
+                    0usize,
+                    0,
+                );
+                libc::_exit(0);
+            }
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            assert!(
+                !(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS),
+                "path-following xattr syscalls must not be killed by the filter"
+            );
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "child should run both syscalls and exit cleanly, status={status:#x}"
+            );
+        }
+    }
+
+    /// The credential interceptor's HTTP server writes to the guest with writev;
+    /// a filter without it kills the VMM on the first intercepted request.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn seccomp_allows_vectored_writes() {
+        let program = build_seccomp_program(true, false).expect("build seccomp program");
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                let data = *b"ok";
+                let iov = libc::iovec {
+                    iov_base: data.as_ptr() as *mut libc::c_void,
+                    iov_len: data.len(),
+                };
+                let written = libc::syscall(libc::SYS_writev, fds[1], &iov, 1);
+                libc::_exit(if written == 2 { 0 } else { 3 });
+            }
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+            assert!(
+                !(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS),
+                "writev must not be killed by the filter"
+            );
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "child should write through writev and exit cleanly, status={status:#x}"
             );
         }
     }

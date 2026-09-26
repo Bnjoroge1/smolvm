@@ -128,6 +128,8 @@ pub struct VirtioPollConfig {
     pub upstream_dns: Ipv4Addr,
     /// Dedicated loopback service reachable only at the guest-visible gateway.
     pub host_service: Option<crate::GatewayHostService>,
+    /// Host interceptor and the outbound streams routed through it.
+    pub intercept: Option<crate::StreamInterception>,
     /// IP-level MTU.
     pub mtu: usize,
 }
@@ -252,7 +254,13 @@ fn run_network_stack(
         gateway_addrs.to_vec(),
         config.host_service,
     )
-    .with_published_port_seed(port_seed);
+    .with_published_port_seed(port_seed)
+    .with_intercept(config.intercept);
+    let datagram_egress = if config.intercept.is_some_and(|mode| mode.all_tcp()) {
+        EgressPolicy::from_allowed_cidrs(Some(&[]))
+    } else {
+        egress.clone()
+    };
     let mut relay_spawn_attempts = 0_u64;
     let mut relay_spawn_successes = 0_u64;
     let mut relay_spawn_failures = 0_u64;
@@ -358,7 +366,7 @@ fn run_network_stack(
                     // is silently dropped (a guest sees a normal UDP black hole),
                     // but the denial is recorded in the boot log — these lines are
                     // the machine's egress audit trail (`read_egress_denials`).
-                    let relay_allowed = udp_relay::should_relay_udp(destination, &egress);
+                    let relay_allowed = udp_relay::should_relay_udp(destination, &datagram_egress);
                     if !relay_allowed && destination.port() != 53 {
                         egress.record_denial("sendto", &destination);
                     }
@@ -444,7 +452,7 @@ fn run_network_stack(
             &mut sockets,
             icmp4_handle,
             false,
-            &egress,
+            &datagram_egress,
             &gateway_addrs,
             &icmp_channels.to_relay,
         );
@@ -452,7 +460,7 @@ fn run_network_stack(
             &mut sockets,
             icmp6_handle,
             true,
-            &egress,
+            &datagram_egress,
             &gateway_addrs,
             &icmp_channels.to_relay,
         );
@@ -1344,6 +1352,7 @@ mod tests {
             prefix_len6: 64,
             upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
             host_service: None,
+            intercept: None,
             mtu: 1500,
         };
         let queues = NetworkFrameQueues::shared(32);

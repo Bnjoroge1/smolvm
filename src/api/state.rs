@@ -7,7 +7,7 @@ use crate::config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use crate::db::SmolvmDb;
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -67,7 +67,7 @@ fn retained_fork_lineage(vms: &[(String, VmRecord)]) -> HashSet<String> {
 /// Shared API server state.
 pub struct ApiState {
     /// Registry of machine managers by name.
-    machines: RwLock<HashMap<String, Arc<parking_lot::Mutex<MachineEntry>>>>,
+    machines: RwLock<BTreeMap<String, Arc<parking_lot::Mutex<MachineEntry>>>>,
     /// Reserved machine names (creation in progress).
     /// This prevents race conditions during machine creation.
     reserved_names: RwLock<HashSet<String>>,
@@ -137,6 +137,11 @@ pub struct ApiState {
 pub struct MachineEntry {
     /// Resolved workload image, matching the persisted machine record.
     pub image: Option<String>,
+    /// Credential policy launch description, when the machine has one.
+    pub credentials: Option<crate::credentials::CredentialLaunch>,
+    /// API-provided interceptor binding retained only in this server process
+    /// so automatic and implicit restarts can rebind without persisting a token.
+    pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     /// The agent manager for this machine.
     pub manager: AgentManager,
     /// Host mounts configured for this machine.
@@ -195,6 +200,8 @@ pub struct MachineRegistration {
     pub image: Option<String>,
     /// Path to .smolmachine sidecar this machine was created from.
     pub source_smolmachine: Option<String>,
+    /// Registry reference that sidecar was pulled from, if any.
+    pub source_registry_ref: Option<String>,
     /// Container entrypoint (from manifest).
     pub entrypoint: Vec<String>,
     /// Container cmd (from manifest).
@@ -212,6 +219,9 @@ pub struct MachineRegistration {
     /// Secret refs to attach to this machine (from a Smolfile or
     /// `CreateMachineRequest.secrets`).
     pub secret_refs: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
+    /// Placeholders a restored checkpoint's workload already holds for its
+    /// credential bindings. Empty mints fresh ones.
+    pub credential_placeholders: std::collections::BTreeMap<String, String>,
 }
 
 /// RAII guard for machine name reservation.
@@ -303,7 +313,7 @@ impl ApiState {
             ApiError::internal(format!("failed to initialize database tables: {}", e))
         })?;
         Ok(Self {
-            machines: RwLock::new(HashMap::new()),
+            machines: RwLock::new(BTreeMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
             lifecycle_locks: RwLock::new(HashMap::new()),
             db,
@@ -322,7 +332,7 @@ impl ApiState {
     /// Useful for testing with temporary databases.
     pub fn with_db(db: SmolvmDb) -> Self {
         Self {
-            machines: RwLock::new(HashMap::new()),
+            machines: RwLock::new(BTreeMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
             lifecycle_locks: RwLock::new(HashMap::new()),
             db,
@@ -439,7 +449,10 @@ impl ApiState {
             // process is no longer alive.  Machines in "created" state (pid=None)
             // have never been started and must be preserved — they are valid
             // configs waiting for a start call.
-            if record.pid.is_some() && !record.is_process_alive() {
+            if record.paused_checkpoint.is_none()
+                && record.pid.is_some()
+                && !record.is_process_alive()
+            {
                 if retained_lineage.contains(&name) {
                     tracing::warn!(
                         machine = %name,
@@ -508,7 +521,9 @@ impl ApiState {
                 block_io: Some(record.block_io),
                 allowed_cidrs: record.allowed_cidrs.clone(),
                 allowed_hosts: record.dns_filter_hosts.clone(),
+                credentials: record.credential_policy.clone(),
                 network_backend: record.network_backend,
+                guest_subnet: record.guest_subnet.clone(),
             };
 
             // Create AgentManager and try to reconnect
@@ -537,6 +552,11 @@ impl ApiState {
                         name.clone(),
                         Arc::new(parking_lot::Mutex::new(MachineEntry {
                             image: record.image.clone(),
+                            credentials: crate::credentials::CredentialLaunch::for_record(
+                                &record.name,
+                                &record,
+                            ),
+                            external_interceptor: None,
                             manager,
                             mounts,
                             ports,
@@ -742,7 +762,7 @@ impl ApiState {
         }
     }
 
-    /// List all machines.
+    /// List all machines, in name order.
     pub fn list_machines(&self) -> Vec<MachineInfo> {
         let machines = self.machines.read();
         machines
@@ -1045,7 +1065,22 @@ impl ApiState {
         // dropped here, so API-created machines silently lost both).
         record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
         record.dns_filter_hosts = reg.resources.allowed_hosts.clone();
+        if let Some(policy) = reg.resources.credentials.clone().filter(|p| !p.is_empty()) {
+            record.credential_placeholders = if reg.credential_placeholders.is_empty() {
+                crate::credentials::prepare_policy(&policy, reg.resources.allowed_hosts.as_deref())?
+            } else {
+                policy
+                    .validate(reg.resources.allowed_hosts.as_deref())
+                    .map_err(|e| ApiError::BadRequest(format!("credentials: {e}")))?;
+                reg.credential_placeholders.clone()
+            };
+            record.credential_policy = Some(policy);
+            // Bindings from an API caller are never resolved from this host's
+            // environment; their values arrive over the API.
+            record.credentials_supplied_by_api = true;
+        }
         record.network_backend = reg.resources.network_backend;
+        record.guest_subnet = reg.resources.guest_subnet.clone();
         // GPU flags (previously dropped here, so API-created machines
         // silently lost CUDA/GPU on restart).
         record.gpu = reg.resources.gpu;
@@ -1055,6 +1090,7 @@ impl ApiState {
         record.docker_socket = reg.docker_socket;
         record.image = reg.image;
         record.source_smolmachine = reg.source_smolmachine.clone();
+        record.source_registry_ref = reg.source_registry_ref.clone();
         record.entrypoint = reg.entrypoint;
         record.cmd = reg.cmd;
         record.env = reg.env;
@@ -1094,6 +1130,11 @@ impl ApiState {
                     name,
                     Arc::new(parking_lot::Mutex::new(MachineEntry {
                         image: record.image.clone(),
+                        credentials: crate::credentials::CredentialLaunch::for_record(
+                            &record.name,
+                            &record,
+                        ),
+                        external_interceptor: None,
                         manager: reg.manager,
                         mounts: reg.mounts,
                         ports: reg.ports,
@@ -1343,6 +1384,7 @@ pub fn build_launch_features(
     machine_name: Option<&str>,
     source_smolmachine: Option<&str>,
     dns_filter_hosts: Option<Vec<String>>,
+    credentials: Option<crate::credentials::CredentialLaunch>,
 ) -> crate::Result<crate::agent::LaunchFeatures> {
     let features = crate::agent::LaunchFeatures::default();
     let mut features = match machine_name {
@@ -1356,6 +1398,7 @@ pub fn build_launch_features(
     // starts the DNS filter for these names and learns their answers into the
     // egress allow-list (parity with the CLI `--allow-host` path).
     features.dns_filter_hosts = dns_filter_hosts;
+    features.credentials = credentials;
     Ok(features)
 }
 
@@ -1409,11 +1452,13 @@ pub async fn ensure_machine_running(
                 entry.manager.name(),
                 entry.source_smolmachine.as_deref(),
                 entry.resources.allowed_hosts.clone(),
+                entry.credentials.clone(),
             )?
         };
         features.cuda_fork_pool_size = entry.cuda_fork_pool_size;
         features.cuda_vram_limit_mib = entry.cuda_vram_limit_mib;
         features.forkable = entry.forkable;
+        features.external_interceptor = entry.external_interceptor;
         entry
             .manager
             .ensure_running_via_subprocess(mounts, ports, resources, features)?;
@@ -1421,6 +1466,19 @@ pub async fn ensure_machine_running(
     })
     .await
     .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?
+}
+
+/// A paused machine must be resumed, never booted fresh: an implicit start
+/// (exec, files, images) would discard its saved execution and leave it unable
+/// to resume or pause again. Explicit start refuses the same way.
+fn refuse_implicit_start_of_paused(record: &crate::config::VmRecord) -> crate::Result<()> {
+    if record.paused_checkpoint.is_some() {
+        return Err(crate::Error::agent_conflict(
+            "start machine",
+            "machine has saved execution; use resume",
+        ));
+    }
+    Ok(())
 }
 
 /// Ensure a machine is running and persist the Running state to the database.
@@ -1452,6 +1510,7 @@ pub async fn ensure_running_and_persist(
     // running machines, so a running machine's entry can't be stale — and for
     // one, ensure_machine_running early-returns before the config matters.
     if let Ok(Some(record)) = state.lookup_vm(name).await {
+        refuse_implicit_start_of_paused(&record)?;
         let mut e = entry.lock();
         e.mounts = record.host_mounts().iter().map(MountSpec::from).collect();
         e.ports = record
@@ -1468,6 +1527,9 @@ pub async fn ensure_running_and_persist(
         e.forkable = record.forkable_on_start();
         e.cuda_fork_pool_size = record.cuda_fork_pool_size;
         e.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
+        if !record.external_interceptor_required {
+            e.external_interceptor = None;
+        }
     }
 
     let freshly_booted = ensure_machine_running(entry).await?;
@@ -1531,10 +1593,10 @@ async fn relaunch_image_workload(
     let mut command = record.entrypoint.clone();
     command.extend(record.cmd.clone());
     let mut env = record.env.clone();
-    env.extend(crate::secrets::expose_into_env(
+    env.extend(
         crate::api::handlers::record_secret_refs_env(entry)
             .map_err(|e| crate::Error::agent("resolve workload secrets", format!("{e:?}")))?,
-    ));
+    );
     // Remote volumes mount inside the workload container; build the mount script
     // here and let the agent run it ahead of the image-resolved command, so a
     // service image's own entrypoint is preserved rather than clobbered.
@@ -1666,11 +1728,13 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         storage_gib: spec.storage_gb,
         overlay_gib: spec.overlay_gb,
         block_io: spec.block_io.unwrap_or_default(),
+        disks: Vec::new(),
         allowed_cidrs: spec.allowed_cidrs.clone(),
         // Custom DNS is a local-CLI feature for now; the cloud ResourceSpec
         // does not expose it, so API-launched VMs inherit the backend default.
         dns: None,
         network_name: None,
+        guest_subnet: spec.guest_subnet.clone(),
     }
 }
 
@@ -1689,7 +1753,9 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         // VmResources has no hostname allow-list; callers that need it graft it
         // back from the source record (see the MachineEntry reload path).
         allowed_hosts: None,
+        credentials: None,
         network_backend: res.network_backend,
+        guest_subnet: res.guest_subnet,
     }
 }
 
@@ -1798,6 +1864,19 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_start_refuses_a_machine_with_saved_execution() {
+        let mut record =
+            crate::config::VmRecord::new("paused".into(), 1, 512, vec![], vec![], false);
+        assert!(refuse_implicit_start_of_paused(&record).is_ok());
+        record.paused_checkpoint = Some("/saved/execution".into());
+        let error = refuse_implicit_start_of_paused(&record).unwrap_err();
+        assert!(matches!(
+            crate::api::ApiError::from(error),
+            crate::api::ApiError::Conflict(_)
+        ));
+    }
     use futures_util::FutureExt as _;
     use tempfile::TempDir;
 
@@ -1881,7 +1960,9 @@ mod tests {
             block_io: None,
             allowed_cidrs: None,
             allowed_hosts: None,
+            credentials: None,
             network_backend: None,
+            guest_subnet: None,
         };
         let res = resource_spec_to_vm_resources(&spec, false);
         assert_eq!(res.cpus, DEFAULT_MICROVM_CPU_COUNT);
@@ -1898,11 +1979,11 @@ mod tests {
         // The serve-API launch path must forward the egress hostname allow-list
         // into the boot config, so `internal_boot` starts the DNS filter for it.
         let hosts = vec!["api.anthropic.com".to_string(), "pypi.org".to_string()];
-        let features = build_launch_features(None, None, Some(hosts.clone())).unwrap();
+        let features = build_launch_features(None, None, Some(hosts.clone()), None).unwrap();
         assert_eq!(features.dns_filter_hosts, Some(hosts));
 
         // No hostname policy stays None (unrestricted egress, unchanged behavior).
-        let features = build_launch_features(None, None, None).unwrap();
+        let features = build_launch_features(None, None, None, None).unwrap();
         assert_eq!(features.dns_filter_hosts, None);
     }
 
@@ -1928,6 +2009,8 @@ mod tests {
         state.insert_machine(
             name,
             MachineEntry {
+                credentials: None,
+                external_interceptor: None,
                 manager: AgentManager::for_vm(name).unwrap(),
                 image: None,
                 mounts: vec![],
@@ -1943,7 +2026,9 @@ mod tests {
                     block_io: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
+                    credentials: None,
                     network_backend: None,
+                    guest_subnet: None,
                 },
                 restart: RestartConfig::default(),
                 network: false,
@@ -1986,6 +2071,8 @@ mod tests {
         state.insert_machine(
             "remove-test-m1",
             MachineEntry {
+                credentials: None,
+                external_interceptor: None,
                 manager,
                 image: None,
                 mounts: vec![],
@@ -2001,7 +2088,9 @@ mod tests {
                     block_io: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
+                    credentials: None,
                     network_backend: None,
+                    guest_subnet: None,
                 },
                 restart: RestartConfig::default(),
                 network: false,
@@ -2055,6 +2144,8 @@ mod tests {
         state.insert_machine(
             "busy-m1",
             MachineEntry {
+                credentials: None,
+                external_interceptor: None,
                 manager,
                 image: None,
                 mounts: vec![],
@@ -2070,7 +2161,9 @@ mod tests {
                     block_io: None,
                     allowed_cidrs: None,
                     allowed_hosts: None,
+                    credentials: None,
                     network_backend: None,
+                    guest_subnet: None,
                 },
                 restart: RestartConfig::default(),
                 network: false,
@@ -2107,6 +2200,21 @@ mod tests {
     // ========================================================================
     // Startup reconciliation tests
     // ========================================================================
+
+    #[test]
+    fn saved_execution_survives_reconciliation_with_a_stale_pid() {
+        let (_dir, state) = temp_api_state();
+        let name = "durable-paused-reconciliation";
+        let mut record = VmRecord::new(name.into(), 1, 512, vec![], vec![], false);
+        record.pid = Some(i32::MAX);
+        record.state = RecordState::Paused;
+        record.paused_checkpoint = Some("saved.smolcheckpoint".into());
+        state.db.insert_vm(name, &record).unwrap();
+        assert!(state.load_persisted_machines().contains(&name.to_string()));
+        let retained = state.db.get_vm(name).unwrap().unwrap();
+        assert_eq!(retained.state, RecordState::Paused);
+        assert_eq!(retained.paused_checkpoint, record.paused_checkpoint);
+    }
 
     #[test]
     fn test_load_persisted_machines_removes_dead_records() {

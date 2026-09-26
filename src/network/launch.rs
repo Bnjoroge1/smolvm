@@ -81,6 +81,22 @@ impl LaunchNetworkPlan {
     }
 }
 
+/// Move the guest link onto the machine's `--guest-subnet`, when it has one.
+///
+/// Shared by the static and dynamic launchers so the two cannot diverge.
+pub fn apply_guest_subnet(
+    guest_network: smolvm_network::GuestNetworkConfig,
+    resources: &VmResources,
+) -> crate::Result<smolvm_network::GuestNetworkConfig> {
+    match resources.guest_subnet.as_deref() {
+        None => Ok(guest_network),
+        Some(subnet) => subnet
+            .parse::<smolvm_network::GuestSubnet>()
+            .map(|subnet| guest_network.with_guest_subnet(subnet))
+            .map_err(|reason| crate::Error::config("guest subnet", reason)),
+    }
+}
+
 /// Compute the effective launch backend from user intent.
 ///
 /// virtio-net now enforces the full egress policy (CIDR + allow-host DNS
@@ -91,6 +107,20 @@ pub fn plan_launch_network(
     dns_filter_hosts: Option<&[String]>,
     port_count: usize,
 ) -> LaunchNetworkPlan {
+    plan_launch_network_with(resources, dns_filter_hosts, port_count, false)
+}
+
+/// [`plan_launch_network`] for a machine that may also carry a credential
+/// policy. Credential substitution is enforced by the host-side virtio-net
+/// stack, so a policy implies networking and steers the default backend to
+/// virtio-net exactly as an egress allow-list does; an explicit backend choice
+/// is still honored (TSI then needs the libkrun interception hook).
+pub fn plan_launch_network_with(
+    resources: &VmResources,
+    dns_filter_hosts: Option<&[String]>,
+    port_count: usize,
+    has_credentials: bool,
+) -> LaunchNetworkPlan {
     let has_ports = port_count > 0;
     let has_cidr_policy = resources
         .allowed_cidrs
@@ -99,8 +129,16 @@ pub fn plan_launch_network(
     let has_dns_filter = dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty());
     let has_host_service = guest_host_service_configured();
     let has_fabric = resources.network_name.is_some();
-    let wants_network =
-        resources.network || has_ports || has_cidr_policy || has_dns_filter || has_fabric;
+    // A custom guest subnet shapes the virtio-net link, so like a named
+    // network it implies networking and picks virtio-net.
+    let has_guest_subnet = resources.guest_subnet.is_some();
+    let wants_network = resources.network
+        || has_ports
+        || has_cidr_policy
+        || has_dns_filter
+        || has_fabric
+        || has_guest_subnet
+        || has_credentials;
 
     if !wants_network {
         return LaunchNetworkPlan {
@@ -138,9 +176,11 @@ pub fn plan_launch_network(
         if has_ports
             || fleet_mode
             || has_cidr_policy
+            || has_credentials
             || has_dns_filter
             || has_host_service
             || has_fabric
+            || has_guest_subnet
         {
             NetworkBackend::VirtioNet
         } else {
@@ -187,6 +227,7 @@ pub fn validate_requested_network_backend(
             || has_egress_policy
             || has_host_service
             || resources.network_name.is_some()
+            || resources.guest_subnet.is_some()
         {
             NetworkBackend::VirtioNet
         } else {
@@ -211,6 +252,27 @@ pub fn validate_requested_network_backend(
             "network",
             "--network requires the virtio-net backend; remove --net-backend tsi or set it to virtio-net",
         ));
+    }
+
+    // A custom guest subnet shapes the virtio-net link; TSI has no guest link
+    // for it to apply to, and a named network assigns addresses from its own
+    // pool, so both combinations would silently ignore the subnet.
+    if let Some(subnet) = resources.guest_subnet.as_deref() {
+        subnet
+            .parse::<smolvm_network::GuestSubnet>()
+            .map_err(|reason| crate::Error::config("guest subnet", reason))?;
+        if backend != NetworkBackend::VirtioNet {
+            return Err(crate::Error::config(
+                "guest subnet",
+                "--guest-subnet requires the virtio-net backend; remove --net-backend tsi or set it to virtio-net",
+            ));
+        }
+        if resources.network_name.is_some() {
+            return Err(crate::Error::config(
+                "guest subnet",
+                "--guest-subnet cannot be combined with --network: a named network assigns member addresses itself",
+            ));
+        }
     }
 
     // Same for an egress policy — fires only on EXPLICIT TSI + policy.
@@ -249,6 +311,46 @@ mod tests {
 
     fn resources() -> VmResources {
         VmResources::default()
+    }
+
+    #[test]
+    fn guest_subnet_implies_virtio_net() {
+        let mut resources = resources();
+        resources.guest_subnet = Some("10.200.0.0/30".into());
+        let plan = plan_launch_network(&resources, None, 0);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+        assert!(validate_requested_network_backend(&resources, None, 0).is_ok());
+
+        let config =
+            apply_guest_subnet(smolvm_network::GuestNetworkConfig::default(), &resources).unwrap();
+        assert_eq!(config.gateway_ip, std::net::Ipv4Addr::new(10, 200, 0, 1));
+        assert_eq!(config.dns_server, config.gateway_ip);
+    }
+
+    #[test]
+    fn guest_subnet_rejects_tsi_named_networks_and_bad_cidrs() {
+        let mut tsi = resources();
+        tsi.guest_subnet = Some("10.200.0.0/30".into());
+        tsi.network_backend = Some(NetworkBackend::Tsi);
+        assert!(validate_requested_network_backend(&tsi, None, 0).is_err());
+
+        let mut fabric = resources();
+        fabric.guest_subnet = Some("10.200.0.0/30".into());
+        fabric.network_name = Some("lab".into());
+        assert!(validate_requested_network_backend(&fabric, None, 0).is_err());
+
+        let mut bad = resources();
+        bad.guest_subnet = Some("10.200.0.1/30".into());
+        assert!(validate_requested_network_backend(&bad, None, 0).is_err());
+        assert!(apply_guest_subnet(smolvm_network::GuestNetworkConfig::default(), &bad).is_err());
+    }
+
+    #[test]
+    fn no_guest_subnet_keeps_the_default_link() {
+        let config =
+            apply_guest_subnet(smolvm_network::GuestNetworkConfig::default(), &resources())
+                .unwrap();
+        assert_eq!(config, smolvm_network::GuestNetworkConfig::default());
     }
 
     #[test]

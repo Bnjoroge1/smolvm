@@ -25,6 +25,16 @@ use smolvm_protocol::AgentResponse;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
+/// Floor for the temporary pack VM's storage disk (GiB). Matches the export
+/// helper's floor: a realistic image pull plus the agent rootfs needs more
+/// than the 20 GiB machine default.
+const PACK_VM_MIN_STORAGE_GIB: u64 = 64;
+
+/// Multiplier on an image's compressed layer total when sizing the pack VM's
+/// storage disk. Extraction inflates gzip'd layers ~3×; the rest is margin —
+/// the disk is sparse, so over-sizing costs nothing on the host.
+const PACK_VM_STORAGE_FACTOR: u64 = 8;
+
 /// Package and run self-contained VM executables.
 #[derive(Subcommand, Debug)]
 pub enum PackCmd {
@@ -77,6 +87,18 @@ pub struct CheckpointCmd {
     /// Export a stored checkpoint directory as one portable file.
     #[arg(long, value_name = "CHECKPOINT", conflicts_with = "store")]
     pub export_from: Option<PathBuf>,
+    /// With --export-from: which generation to export — `~N` (N back along
+    /// the history, `~0` is the checkpoint itself), a generation id, or an id
+    /// prefix. See `machine checkpoint-log`.
+    #[arg(long, value_name = "GENERATION", requires = "export_from")]
+    pub at: Option<String>,
+    /// How many earlier generations to carry: with --store, the new checkpoint
+    /// retains them so any can be restored from it alone; with --export-from,
+    /// the exported file carries them (0 exports one generation in the classic
+    /// layout readable by older runtimes). Unchanged chunks are shared either
+    /// way, so history costs only the differences.
+    #[arg(long, value_name = "N", default_value_t = smolvm::portable_checkpoint::DEFAULT_HISTORY)]
+    pub history: usize,
 
     /// Reuse unchanged chunks here; output becomes a self-contained directory
     /// on the same filesystem (copy the whole directory to move it).
@@ -107,19 +129,28 @@ impl CheckpointCmd {
     /// Capture and package a live machine at one RAM/disk consistency boundary.
     pub fn run(self) -> smolvm::Result<()> {
         if let Some(source) = self.export_from {
-            let bytes = smolvm::checkpoint_store::export(&source, &self.output)
-                .map_err(|e| smolvm::Error::agent("export checkpoint", e.to_string()))?;
+            let (bytes, carried) = smolvm::portable_checkpoint::export_checkpoint(
+                &source,
+                self.at.as_deref(),
+                self.history,
+                &self.output,
+            )?;
             println!(
-                "Exported checkpoint to {} ({} MiB)",
+                "Exported checkpoint to {} ({} MiB{})",
                 self.output.display(),
-                bytes / (1024 * 1024)
+                bytes / (1024 * 1024),
+                if carried > 0 {
+                    format!(", carrying {carried} earlier generation(s)")
+                } else {
+                    String::new()
+                }
             );
             return Ok(());
         }
         let name = self
             .name
             .ok_or_else(|| smolvm::Error::config("checkpoint", "--name is required"))?;
-        let result = smolvm::portable_checkpoint::capture_to_path(
+        let result = smolvm::portable_checkpoint::capture_to_path_with_history(
             &name,
             &self.output,
             &smolvm::portable_checkpoint::CaptureOptions {
@@ -129,6 +160,7 @@ impl CheckpointCmd {
                 lib_dir: self.lib_dir,
                 rootfs_dir: self.rootfs_dir,
             },
+            self.history,
         )?;
         println!(
             "Source resumed after {:.3}s; packaging continued in the background",
@@ -150,6 +182,128 @@ impl CheckpointCmd {
         }
         Ok(())
     }
+}
+
+/// Show the history a checkpoint carries, or every checkpoint a store knows.
+#[derive(Args, Debug)]
+pub struct CheckpointLogCmd {
+    /// A stored checkpoint directory: lists its own generation and every
+    /// earlier one it retains, newest first.
+    #[arg(
+        value_name = "CHECKPOINT",
+        required_unless_present = "store",
+        conflicts_with = "store"
+    )]
+    pub checkpoint: Option<PathBuf>,
+    /// A checkpoint store: lists every checkpoint published into it, oldest
+    /// first, with its parent.
+    #[arg(long, value_name = "DIR")]
+    pub store: Option<PathBuf>,
+    /// Only checkpoints of this machine (with --store).
+    #[arg(long, value_name = "NAME", requires = "store")]
+    pub machine: Option<String>,
+}
+
+impl CheckpointLogCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        if let Some(store) = self.store {
+            let records = smolvm::checkpoint_store::list_lineage(&store).map_err(|e| {
+                smolvm::Error::agent("read checkpoint store lineage", e.to_string())
+            })?;
+            let mut shown = 0;
+            for record in records.iter().filter(|r| {
+                self.machine
+                    .as_deref()
+                    .is_none_or(|m| m == record_machine(r))
+            }) {
+                let present = if std::path::Path::new(&record.path).is_dir() {
+                    ""
+                } else {
+                    "  (directory removed)"
+                };
+                println!(
+                    "{}  {}  {:<20}  parent {}  {}{}",
+                    &record.id[..12],
+                    record.created_at,
+                    record.machine,
+                    record
+                        .parent
+                        .as_deref()
+                        .map_or("-".to_string(), |p| p[..12].to_string()),
+                    record.path,
+                    present
+                );
+                shown += 1;
+            }
+            if shown == 0 {
+                println!("no checkpoints recorded in {}", store.display());
+            }
+            return Ok(());
+        }
+        let checkpoint = self
+            .checkpoint
+            .expect("clap requires a checkpoint or --store");
+        let generations = if checkpoint.is_file() {
+            // Files describe their history in the manifest; no unpacking needed.
+            let manifest = smolvm_pack::packer::read_manifest_from_sidecar(&checkpoint)
+                .map_err(|e| smolvm::Error::agent("read checkpoint manifest", e.to_string()))?;
+            let checkpoint_manifest = manifest.checkpoint.ok_or_else(|| {
+                smolvm::Error::config("checkpoint-log", "not a checkpoint artifact")
+            })?;
+            if checkpoint_manifest.history.is_empty() {
+                match checkpoint_manifest.lineage {
+                    Some(lineage) => vec![smolvm::checkpoint_store::Generation {
+                        id: lineage.id,
+                        parent: lineage.parent,
+                        machine: lineage.machine,
+                        created_at: lineage.created_at,
+                        data_bytes: 0,
+                        retained: false,
+                    }],
+                    None => Vec::new(),
+                }
+            } else {
+                smolvm::checkpoint_store::generations_from_history(&checkpoint_manifest.history)
+            }
+        } else {
+            smolvm::checkpoint_store::lineage_of(&checkpoint)
+                .map_err(|e| smolvm::Error::agent("read checkpoint history", e.to_string()))?
+        };
+        if generations.is_empty() {
+            println!(
+                "{} predates checkpoint history (no lineage recorded)",
+                checkpoint.display()
+            );
+            return Ok(());
+        }
+        for (depth, generation) in generations.iter().enumerate() {
+            let size = if generation.data_bytes > 0 {
+                format!("{} MiB data", generation.data_bytes / (1024 * 1024))
+            } else {
+                String::new()
+            };
+            println!(
+                "~{depth:<3} {}  {}  {:<20}  {size}{}",
+                &generation.id[..12],
+                generation.created_at,
+                generation.machine,
+                if generation.retained {
+                    ""
+                } else {
+                    "  (this checkpoint)"
+                }
+            );
+        }
+        println!(
+            "restore any of them: smolvm machine create --name <new> --from {} --at ~N",
+            checkpoint.display()
+        );
+        Ok(())
+    }
+}
+
+fn record_machine(record: &smolvm::checkpoint_store::LineageRecord) -> &str {
+    &record.machine
 }
 
 /// Reclaim checkpoint cache objects that no retained checkpoint references.
@@ -224,6 +378,14 @@ pub struct PackCreateCmd {
     #[arg(long, value_name = "MiB")]
     pub mem: Option<u32>,
 
+    /// Storage disk size in GiB for the temporary pack VM that pulls and
+    /// flattens the image. When omitted, the disk is sized from the image's
+    /// registry manifest (compressed layer total × headroom, floored at
+    /// [`PACK_VM_MIN_STORAGE_GIB`], which is also used when the manifest
+    /// can't be probed); pass this to override the estimate.
+    #[arg(long, value_name = "GiB")]
+    pub storage: Option<u64>,
+
     /// Target OCI platform for multi-arch images (e.g., linux/arm64, linux/amd64)
     ///
     /// By default, uses the host architecture. Use this to override, for example
@@ -282,6 +444,57 @@ pub struct PackCreateCmd {
 }
 
 impl PackCreateCmd {
+    /// Storage disk size (GiB) for the temporary pack VM.
+    ///
+    /// `--storage` wins; otherwise the image's registry manifest is probed
+    /// host-side and the disk is sized at `compressed ×
+    /// PACK_VM_STORAGE_FACTOR`, floored at `PACK_VM_MIN_STORAGE_GIB`. The
+    /// factor covers gzip's ~3× expansion on extraction plus margin; the floor
+    /// matches the export helper's. When the manifest can't be probed (offline
+    /// registry, local image source) the floor is used: the disk is sparse, so
+    /// over-sizing is free, while under-sizing fails the pull mid-way.
+    fn pack_vm_storage_gib(&self, image: &str, oci_platform: Option<&str>) -> u64 {
+        if let Some(gib) = self.storage {
+            return gib;
+        }
+        if smolvm::data::image_source::is_local_ref(image) {
+            return PACK_VM_MIN_STORAGE_GIB;
+        }
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                warn!(error = %e, "cannot create runtime for image size probe; using the storage floor");
+                return PACK_VM_MIN_STORAGE_GIB;
+            }
+        };
+        match rt.block_on(smolvm::image_store::image_compressed_size(
+            image,
+            &smolvm::registry::PullAuth::FromConfig,
+            oci_platform,
+        )) {
+            Ok(compressed_bytes) => {
+                let compressed_gib = compressed_bytes.div_ceil(smolvm::data::consts::BYTES_PER_GIB);
+                let gib = compressed_gib
+                    .saturating_mul(PACK_VM_STORAGE_FACTOR)
+                    .max(PACK_VM_MIN_STORAGE_GIB);
+                info!(
+                    image = %image,
+                    compressed_gib, gib,
+                    "sized pack VM storage from image manifest"
+                );
+                gib
+            }
+            Err(e) => {
+                warn!(
+                    image = %image,
+                    error = %e,
+                    "image size probe failed; using the pack VM storage floor"
+                );
+                PACK_VM_MIN_STORAGE_GIB
+            }
+        }
+    }
+
     /// Resolve the directory under which the staging temp dir is created.
     ///
     /// Precedence: `--staging-dir` → `SMOLVM_PACK_STAGING` → the disk-backed
@@ -452,7 +665,13 @@ impl PackCreateCmd {
         }
 
         println!("Starting agent VM...");
-        let manager = AgentManager::for_vm_with_sizes(&pack_vm_name, None, None)?;
+        // Size the pack VM's storage disk for the image it has to hold. The
+        // default 20 GiB cannot fit a CI-scale image's extracted layers, and
+        // the disk cannot grow after boot — so the registry manifest (the only
+        // pre-pull bound on pull size) sets the floor here.
+        let pack_storage_gib =
+            Some(self.pack_vm_storage_gib(&image, pack_config.oci_platform.as_deref()));
+        let manager = AgentManager::for_vm_with_sizes(&pack_vm_name, pack_storage_gib, None)?;
         manager.start_with_config(
             Vec::new(),
             VmResources {
@@ -462,12 +681,14 @@ impl PackCreateCmd {
                 network_backend: None,
                 dns: None,
                 network_name: None,
+                guest_subnet: None,
                 gpu: false,
                 nested_virt: false,
                 cuda: false,
-                storage_gib: None,
+                storage_gib: pack_storage_gib,
                 overlay_gib: None,
                 block_io: Default::default(),
+                disks: Vec::new(),
                 gpu_vram_mib: None,
                 rosetta: false,
                 allowed_cidrs: None,
@@ -518,98 +739,81 @@ impl PackCreateCmd {
                 .map_err(|e| Error::agent("collect layers", e.to_string()))?;
         } else {
             // Multiple layers — merge in the VM so runtime gets a single
-            // lowerdir that always mounts instantly.
+            // lowerdir that always mounts instantly. The merge is a read-only
+            // overlay mount whose tar streams straight to the host: no merged
+            // copy and no staged archive on the guest's RAM-sized /tmp, and
+            // whiteouts/opaque markers resolve exactly as the runtime applies
+            // them — a `cp -a` merge resurrected deleted paths.
             println!(
                 "Merging {} layers in VM (one-time cost)...",
                 image_info.layer_count
             );
 
-            // Build the merge command: extract each layer in order (bottom
-            // first), then tar the result. Layer order in image_info.layers
-            // is bottom-to-top, which is the correct copy order.
-            let layer_paths: Vec<String> = image_info
+            // The agent stacks lowerdirs topmost-first, the same order the
+            // runtime container mount uses; image_info.layers lists them
+            // bottom-up, so reverse. Driven agent-side rather than through
+            // `mount(8)` over VmExec: `mount(8)` rejects a `lowerdir=` value
+            // past ~255 bytes, which any image with four or more layers
+            // exceeds.
+            let stack: Vec<String> = image_info
                 .layers
                 .iter()
+                .rev()
                 .map(|d| {
                     let id = d.strip_prefix("sha256:").unwrap_or(d);
                     format!("/storage/layers/{}", id)
                 })
                 .collect();
 
-            // Copy layers bottom-up into /tmp/merged, then tar
-            let mut merge_script = String::from("set -e\nmkdir -p /tmp/merged\n");
-            for (i, layer_path) in layer_paths.iter().enumerate() {
-                // cp -a preserves symlinks, permissions, ownership.
-                // Ignore exit code: cp may fail on device files or sockets
-                // that can't be copied, but the layer content is intact.
-                // Redirect stderr so warnings are visible in the output.
-                merge_script.push_str(&format!(
-                    "echo 'Merging layer {}/{}...'\n\
-                     cp -a {}/. /tmp/merged/ || true\n",
-                    i + 1,
-                    image_info.layer_count,
-                    layer_path
-                ));
-            }
-            // Verify disk space wasn't exhausted during merge
-            merge_script.push_str(
-                "if ! df /tmp/merged | awk 'NR==2{if($4<1024){exit 1}}'; then\n\
-                 echo 'MERGE_FAIL: disk full'; exit 1\nfi\n\
-                 echo 'Creating merged tar...'\n\
-                 tar cf /tmp/merged-layers.tar -C /tmp/merged .\n\
-                 echo 'MERGE_OK'\n",
-            );
-
-            let (exit_code, stdout, stderr) = client.vm_exec(
-                vec!["sh".to_string(), "-c".to_string(), merge_script],
-                vec![],
-                None,
-                None,
-                None,
-            )?;
-
-            // stdout/stderr from vm_exec are now Vec<u8>; convert lossily
-            // for content checks and error messages (merge output is ASCII).
-            let stdout_str = String::from_utf8_lossy(&stdout);
-            let stderr_str = String::from_utf8_lossy(&stderr);
-            if exit_code != 0 || !stdout_str.contains("MERGE_OK") {
-                return Err(Error::agent(
-                    "merge layers",
-                    format!(
-                        "layer merge failed (exit {}): {}",
-                        exit_code,
-                        if stderr_str.is_empty() {
-                            &stdout_str
-                        } else {
-                            &stderr_str
-                        }
-                    ),
-                ));
-            }
-
-            // Download the merged tar — streamed to disk (16 MB chunks,
-            // never holds the full tar in memory).
+            // Stream the merged tar to disk (never buffered whole in memory,
+            // never staged in the guest), then content-address it. Stage in
+            // the layers dir so the final rename is atomic on the same
+            // filesystem.
             print!("  Exporting merged layer...");
             let _ = std::io::Write::flush(&mut std::io::stdout());
-            let merged_hash = hex::encode(Sha256::digest(
-                format!("merged-{}", image_info.digest).as_bytes(),
-            ));
-            let merged_digest = format!("sha256:{}", merged_hash);
-            let merged_file = collector.layer_staging_path(&merged_digest);
-
+            let tmp_file = collector
+                .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
+                .with_file_name("merged-layers.tmp");
             let total_bytes = client
-                .read_file_to_path_capped(
-                    "/tmp/merged-layers.tar",
-                    &merged_file,
+                .flatten_layers_to_path(
+                    &stack,
+                    &tmp_file,
                     smolvm::agent::pack_export_max_total(),
                     |_| {},
                 )
                 .map_err(|e| Error::agent("export merged layer", e.to_string()))?;
-            println!(" {} MB done", total_bytes / (1024 * 1024));
+            if total_bytes == 0 {
+                let _ = std::fs::remove_file(&tmp_file);
+                return Err(Error::agent(
+                    "export merged layer",
+                    "merged layer tar is empty",
+                ));
+            }
 
+            let mut hasher = Sha256::new();
+            {
+                use std::io::Read;
+                let mut f = std::fs::File::open(&tmp_file)
+                    .map_err(|e| Error::agent("read merged layer", e.to_string()))?;
+                let mut buf = vec![0u8; 4 * 1024 * 1024];
+                loop {
+                    let n = f
+                        .read(&mut buf)
+                        .map_err(|e| Error::agent("hash merged layer", e.to_string()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+            }
+            let merged_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+            let merged_file = collector.layer_staging_path(&merged_digest);
+            std::fs::rename(&tmp_file, &merged_file)
+                .map_err(|e| Error::agent("write merged layer", e.to_string()))?;
             collector
                 .register_layer(&merged_digest)
                 .map_err(|e| Error::agent("register merged layer", e.to_string()))?;
+            println!(" {} MB done", total_bytes / (1024 * 1024));
         }
 
         // Stop agent and clean up temp VM data. Propagates stop errors
@@ -704,6 +908,18 @@ impl PackCreateCmd {
                     .map(|v| v.target.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
+            );
+        }
+
+        // A plain pack carries no credential bindings either (only a live
+        // checkpoint does); a workload that expects its `--credential` env var
+        // would otherwise fail with nothing pointing at the cause.
+        if vm.credential_policy.as_ref().is_some_and(|p| !p.is_empty()) {
+            warn!(
+                "VM '{}' has credential bindings; .smolmachine artifacts do not carry them — \
+                 pass --credential again when creating machines from this artifact, or use \
+                 `machine checkpoint`, which carries the bindings",
+                vm_name
             );
         }
 
@@ -1939,6 +2155,7 @@ mod tests {
             output: PathBuf::from("test-output"),
             cpus: Some(2),
             mem: Some(1024),
+            storage: None,
             oci_platform: None,
             entrypoint: None,
             no_sign: false,

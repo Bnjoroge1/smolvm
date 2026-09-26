@@ -85,6 +85,9 @@ workload runs as), `gpu`, `cuda`, `docker_socket`, `storage`, `overlay`, and the
 
 ### Branch a running machine
 
+To stop a machine without losing its running execution, use
+[`machine pause` and `machine resume`](docs/pause-resume.md).
+
 A branch is a live fork: an independent copy-on-write child that resumes with
 the source's running processes, memory, and disk. Start the source as
 branchable, then branch it:
@@ -92,6 +95,18 @@ branchable, then branch it:
 ```bash
 smolvm machine start --name source --branchable
 smolvm machine branch --from source --name child          # checkpoints the source wherever it is
+```
+
+Use `--freeze-source` when many independent children should branch from the
+same point. The source stays paused and later branches reuse its checkpoint,
+so its disk overlay does not gain another backing layer for each branch. The
+source cannot run `machine exec` while frozen. The flag works with both single
+and batch branches. The HTTP branch request and automatic pool creation request
+accept `"freezeSource": true`; a pool retains this setting for refills.
+
+```bash
+smolvm machine branch --from source --name child --freeze-source
+smolvm machine branch --from source --name child-2  # reuses the frozen checkpoint
 ```
 
 To fan out many children from one checkpoint, the source's workload marks the
@@ -144,6 +159,10 @@ Add `--branchable` to a child when it must branch again. `fork`, `--golden`, and
 source in memory; `machine checkpoint` saves that same state as a durable
 `.smolcheckpoint` artifact that can be restored later or elsewhere.
 
+Building checkpoint tooling in Rust? [`smolvm-checkpoint`](crates/smolvm-checkpoint)
+provides incremental storage, verified file restoration, and portable export
+without depending on the VM runtime.
+
 ### Snapshot a machine into a reusable image
 
 You don't need a Dockerfile to keep an environment. Set a machine up however you
@@ -183,6 +202,16 @@ smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget 
 # fails: not in allow list
 ```
 
+**Let untrusted code use a credential it can never read.** The guest gets a placeholder; the host swaps in the real key only on HTTPS requests to the hosts you name. See [docs/credential-substitution.md](docs/credential-substitution.md).
+
+```bash
+NOTION_API_KEY=secret_… smolvm machine run --image alpine \
+  --credential notion=NOTION_API_KEY@api.notion.com -- sh -c \
+  'apk add -q curl; echo $NOTION_API_KEY; curl -s -H "Authorization: Bearer $NOTION_API_KEY" https://api.notion.com/v1/users/me'
+# SMOL_PLACEHOLDER_NOTION_…   <- what the workload sees
+# {"object":"user",...}        <- what Notion received
+```
+
 **Pack into portable executables.** Turn any workload into a self-contained binary. All dependencies are pre-baked, so there is no install step and no runtime downloads, and it boots in <200ms.
 
 ```bash
@@ -190,6 +219,14 @@ smolvm pack create --image python:3.12-alpine -o ./python312
 ./python312 run -- python3 --version
 # Python 3.12.x, isolated: no pyenv/venv/conda needed
 ```
+
+Packaged runs can forward the host SSH agent without copying private keys into the guest:
+
+```bash
+./python312 run --net --ssh-agent -- git clone git@github.com:org/private-repo.git
+```
+
+This requires `SSH_AUTH_SOCK` to point to a running host SSH agent. Forward the agent only to workloads you trust; the guest can request signatures while it is running.
 
 **Use local container images** for CI, air-gapped hosts, and fast iteration. Feed `--image` a `docker save` / `podman save` archive, pipe one on stdin, or point it at an unpacked rootfs directory. Image work is delegated to your container tooling; smolvm just boots the result.
 
@@ -292,7 +329,7 @@ Platform Support
 Known Limitations
 -----------------
 
-* Network is opt-in (`--net` on `machine create`). TCP/UDP only, no ICMP.
+* Network is opt-in (`--net` on `machine create`). The default backend carries TCP and UDP without emulating a network card, so the guest shows no `eth0` and `ping` fails with `Network unreachable` even while HTTP works — check connectivity with `wget` or `curl`, not `ping`. Pass `--net-backend virtio-net` for a real interface, an address of its own, and ICMP.
 * Volume mounts: directories only (no single files). Mounting at `/workspace` (`-v /host/dir:/workspace`) takes priority over the default storage-disk workspace, so your host directory is used instead.
 * macOS: binary must be signed with Hypervisor.framework entitlements (`com.apple.security.hypervisor`). The shipped release is; a re-signed or freshly built binary silently loses it and every VM start then fails with `krun_start_enter returned: -22 (EINVAL)`. Re-sign it (ad-hoc is fine): `codesign --force --sign - --entitlements hv.entitlements <smolvm-bin>` where `hv.entitlements` is a plist containing `<key>com.apple.security.hypervisor</key><true/>`.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).

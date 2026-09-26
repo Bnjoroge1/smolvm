@@ -1062,6 +1062,26 @@ fn expect_completed(resp: AgentResponse, op: &str) -> Result<(i32, Vec<u8>, Vec<
     }
 }
 
+/// Whether a failed agent connect is worth retrying: the guest or its vsock
+/// muxer is briefly not ready, or turned the connection away.
+fn is_transient_connect_error(error_msg: &str) -> bool {
+    // Connection refused/reset are transient during VM startup.
+    // "No such file or directory" occurs when the vsock socket
+    // file hasn't been created yet by libkrun's muxer thread —
+    // transient under concurrent boot contention. A connect the
+    // guest hangs up mid-handshake (socket2 reports "no error set
+    // after POLLHUP") is a refusal too: a guest busy with many
+    // connections turns one away and accepts the next.
+    error_msg.contains("Connection refused")
+        || error_msg.contains("no error set after POLLHUP")
+        || error_msg.contains("connection refused")
+        || error_msg.contains("Connection reset")
+        || error_msg.contains("connection reset")
+        || error_msg.contains("Broken pipe")
+        || error_msg.contains("Resource temporarily unavailable")
+        || error_msg.contains("No such file or directory")
+}
+
 #[cfg(test)]
 impl AgentClient {
     /// Build an `AgentClient` from a pre-connected `UnixStream`.
@@ -1119,21 +1139,7 @@ impl AgentClient {
             RetryConfig::for_connection(),
             "agent connect",
             || Self::connect_once(path),
-            |e| {
-                // Check if this is a transient error worth retrying
-                let error_msg = e.to_string();
-                // Connection refused/reset are transient during VM startup.
-                // "No such file or directory" occurs when the vsock socket
-                // file hasn't been created yet by libkrun's muxer thread —
-                // transient under concurrent boot contention.
-                error_msg.contains("Connection refused")
-                    || error_msg.contains("connection refused")
-                    || error_msg.contains("Connection reset")
-                    || error_msg.contains("connection reset")
-                    || error_msg.contains("Broken pipe")
-                    || error_msg.contains("Resource temporarily unavailable")
-                    || error_msg.contains("No such file or directory")
-            },
+            |e| is_transient_connect_error(&e.to_string()),
         )
     }
 
@@ -1634,7 +1640,8 @@ impl AgentClient {
         branchpoint_outcome(resp, |_| ())
     }
 
-    /// Merge `lowerdirs` (bottom -> top) into a single tar at `output` in the guest.
+    /// Merge `lowerdirs` (topmost first — the order the agent stacks them in)
+    /// into a single tar at `output` in the guest.
     ///
     /// Missing or empty entries are dropped guest-side, so callers can append a
     /// container overlay's upper dir without probing it first.
@@ -1652,8 +1659,8 @@ impl AgentClient {
         expect_ok(resp, "flatten layers")
     }
 
-    /// Merge `lowerdirs` (bottom -> top) and stream the result straight into
-    /// `local_path` as a tar archive.
+    /// Merge `lowerdirs` (topmost first — the order the agent stacks them in)
+    /// and stream the result straight into `local_path` as a tar archive.
     ///
     /// Same merge as [`Self::flatten_layers`], but the archive never lands on the
     /// guest's disk. Prefer this wherever the merged tree can be large: staging
@@ -1680,6 +1687,22 @@ impl AgentClient {
     pub fn storage_status(&mut self) -> Result<StorageStatus> {
         let resp = self.request(&AgentRequest::StorageStatus)?;
         expect_data(resp, "storage status")
+    }
+
+    /// List the entries of a guest directory.
+    ///
+    /// Agents older than this request reject it as an unknown variant, so a
+    /// caller should treat an error as "not available" rather than a failure.
+    pub fn list_directory(&mut self, path: &str) -> Result<Vec<smolvm_protocol::DirectoryEntry>> {
+        let resp = self.request(&AgentRequest::ListDirectory {
+            path: path.to_string(),
+        })?;
+        #[derive(serde::Deserialize)]
+        struct Listing {
+            entries: Vec<smolvm_protocol::DirectoryEntry>,
+        }
+        let listing: Listing = expect_data(resp, "list directory")?;
+        Ok(listing.entries)
     }
 
     /// The guest's own view of machine memory.
@@ -1968,6 +1991,20 @@ impl AgentClient {
 
         // Socket reads remain blocking; poll() determines read readiness.
         // Outbound frames are handled by FrameWriter.
+        // poll() observes the descriptor, not Rust's stdin read-ahead buffer.
+        // A buffered read can strand the end of a request until another write or
+        // EOF arrives, deadlocking clients that keep stdin open for the reply.
+        #[cfg(unix)]
+        let mut stdin_handle = {
+            use std::os::fd::AsFd;
+            std::fs::File::from(
+                stdin()
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .map_err(|e| Error::agent("duplicate stdin", e.to_string()))?,
+            )
+        };
+        #[cfg(not(unix))]
         let mut stdin_handle = stdin();
         let stdin_fd = stdin_raw_fd();
         let socket_fd = self.stream_raw_fd();
@@ -2058,7 +2095,11 @@ impl AgentClient {
                             data: stdin_buf[..n].to_vec(),
                         })?);
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
                     Err(e) => {
                         tracing::debug!(error = %e, "stdin read error, treating as EOF");
                         stdin_eof = true;
@@ -4352,6 +4393,20 @@ mod term_default_tests {
 
 #[cfg(test)]
 mod flatten_timeout_tests {
+
+    #[test]
+    fn a_connect_the_guest_hangs_up_is_retried() {
+        assert!(super::is_transient_connect_error(
+            "connect to agent: no error set after POLLHUP"
+        ));
+        assert!(super::is_transient_connect_error(
+            "Connection refused (os error 111)"
+        ));
+        assert!(!super::is_transient_connect_error(
+            "Permission denied (os error 13)"
+        ));
+    }
+
     use super::*;
 
     // `set_var`/`remove_var` are process-global and the tests run in parallel

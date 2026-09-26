@@ -14,7 +14,7 @@ use crate::error::Result;
 use crate::network::NetworkBackend;
 use serde::{Deserialize, Serialize};
 pub use smolvm_protocol::publish_socket::SocketDirection;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// A user-published host↔guest Unix-socket bridge (`--expose-socket` /
 /// `--mount-socket`), persisted on the VM record. The vsock port is assigned at
@@ -44,6 +44,10 @@ pub enum RecordState {
     Running,
     /// VM exited cleanly.
     Stopped,
+    /// Execution is saved durably; use resume rather than a fresh boot.
+    Paused,
+    /// A final execution boundary is being saved before stopping.
+    Pausing,
     /// VM crashed or error.
     Failed,
     /// libkrun VMM process is alive but the guest agent is not
@@ -71,6 +75,8 @@ impl std::fmt::Display for RecordState {
             RecordState::Created => write!(f, "created"),
             RecordState::Running => write!(f, "running"),
             RecordState::Stopped => write!(f, "stopped"),
+            RecordState::Paused => write!(f, "paused"),
+            RecordState::Pausing => write!(f, "pausing"),
             RecordState::Failed => write!(f, "failed"),
             RecordState::Unreachable => write!(f, "unreachable"),
             RecordState::Frozen => write!(f, "frozen"),
@@ -202,8 +208,9 @@ pub struct SmolvmConfig {
     /// Storage volume path (macOS only, for case-sensitive filesystem).
     #[cfg(target_os = "macos")]
     pub storage_volume: String,
-    /// Registry of known VMs (by name) - in-memory cache.
-    pub vms: HashMap<String, VmRecord>,
+    /// Registry of known VMs (by name) - in-memory cache. Ordered by name so
+    /// every listing comes out the same way; a hash map reshuffles per process.
+    pub vms: BTreeMap<String, VmRecord>,
 }
 
 impl SmolvmConfig {
@@ -220,7 +227,7 @@ impl SmolvmConfig {
             default_dns: network::default_dns(),
             #[cfg(target_os = "macos")]
             storage_volume: String::new(),
-            vms: HashMap::new(),
+            vms: BTreeMap::new(),
         })
     }
 }
@@ -327,7 +334,7 @@ impl SmolvmConfig {
         self.vms.get(id)
     }
 
-    /// List all VM records.
+    /// List all VM records, in name order.
     pub fn list_vms(&self) -> impl Iterator<Item = (&String, &VmRecord)> {
         self.vms.iter()
     }
@@ -373,6 +380,10 @@ pub struct VmRecord {
     #[serde(default)]
     pub state: RecordState,
 
+    /// Durable execution state retained until a successful explicit resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_checkpoint: Option<std::path::PathBuf>,
+
     /// Process ID when running.
     #[serde(default)]
     pub pid: Option<i32>,
@@ -393,6 +404,11 @@ pub struct VmRecord {
     /// Host engine used for writable virtio block disks.
     #[serde(default)]
     pub block_io: crate::data::resources::BlockIoEngine,
+
+    /// Host disks attached beyond the managed storage and overlay disks
+    /// (`--disk`). Persisted so every start re-attaches them in the same order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<crate::data::disk::AttachedDisk>,
 
     /// Volume mounts (host_path, guest_path, read_only).
     #[serde(default)]
@@ -502,6 +518,10 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
 
+    /// IPv4 subnet for the guest link (virtio-net only). None = `100.96.0.0/30`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_subnet: Option<String>,
+
     /// OCI image for auto-container creation on start.
     #[serde(default)]
     pub image: Option<String>,
@@ -581,6 +601,31 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,
 
+    /// Credential bindings the workload may use through the host interceptor
+    /// (`[[network.credentials]]` / `--credential`). Names and destinations
+    /// only; values are resolved on the host per request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_policy: Option<smolvm_protocol::CredentialPolicy>,
+
+    /// A host interceptor was bound to this machine. Future boots must supply
+    /// an interceptor again; the token and endpoint remain launch-scoped and
+    /// are never written to the machine record.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub external_interceptor_required: bool,
+
+    /// Binding name → placeholder handed to the guest in the bound variable.
+    /// Minted once at create and kept stable so processes captured in a
+    /// checkpoint or fork keep working after restore.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub credential_placeholders: std::collections::BTreeMap<String, String>,
+
+    /// The credential bindings came in over the HTTP API, so their values come
+    /// only from that API (`PUT /machines/{name}/credential-values`) and never
+    /// from this host's environment: an API caller must not be able to route a
+    /// host variable to a host of its choosing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub credentials_supplied_by_api: bool,
+
     /// True for `machine run` VMs. Auto-deleted on exit or cleanup sweep.
     #[serde(default)]
     pub ephemeral: bool,
@@ -590,6 +635,11 @@ pub struct VmRecord {
     /// them via virtiofs instead of pulling the image from a registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_smolmachine: Option<String>,
+
+    /// Registry reference `source_smolmachine` was pulled from, if any. Carried
+    /// into a live checkpoint so another host can fetch the same pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_registry_ref: Option<String>,
 
     /// Name of the golden VM this machine was forked from, if any. A clone's
     /// block disks are copy-on-write overlays backed by the golden's disks, so
@@ -613,6 +663,12 @@ pub struct VmRecord {
     /// until this exact VMM process exits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_lineage_pid_start_time: Option<u64>,
+
+    /// The checkpoint this machine's state continues from: the last checkpoint
+    /// captured from it, or the one it was restored from. The next capture
+    /// records it as its parent, which is what links checkpoints into history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_head: Option<String>,
 
     /// Persistent container-overlay owner inherited from the root of a fork
     /// lineage. A clone's live overlay keeps its original on-disk name across
@@ -708,11 +764,13 @@ impl VmRecord {
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
+            paused_checkpoint: None,
             pid: None,
             pid_start_time: None,
             cpus,
             mem,
             block_io: Default::default(),
+            disks: Vec::new(),
             mounts,
             staged_mounts: Vec::new(),
             ports,
@@ -737,6 +795,7 @@ impl VmRecord {
             network_backend: None,
             dns: None,
             network_name: None,
+            guest_subnet: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -754,9 +813,15 @@ impl VmRecord {
             cuda_preload_modules: false,
             docker_socket: false,
             dns_filter_hosts: None,
+            credential_policy: None,
+            external_interceptor_required: false,
+            credential_placeholders: std::collections::BTreeMap::new(),
+            credentials_supplied_by_api: false,
             ephemeral: false,
             source_smolmachine: None,
+            source_registry_ref: None,
             golden: None,
+            checkpoint_head: None,
             fork_generation: None,
             fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,
@@ -781,11 +846,13 @@ impl VmRecord {
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
+            paused_checkpoint: None,
             pid: None,
             pid_start_time: None,
             cpus,
             mem,
             block_io: Default::default(),
+            disks: Vec::new(),
             mounts,
             staged_mounts: Vec::new(),
             ports,
@@ -810,6 +877,7 @@ impl VmRecord {
             network_backend: None,
             dns: None,
             network_name: None,
+            guest_subnet: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -827,9 +895,15 @@ impl VmRecord {
             cuda_preload_modules: false,
             docker_socket: false,
             dns_filter_hosts: None,
+            credential_policy: None,
+            external_interceptor_required: false,
+            credential_placeholders: std::collections::BTreeMap::new(),
+            credentials_supplied_by_api: false,
             ephemeral: false,
             source_smolmachine: None,
+            source_registry_ref: None,
             golden: None,
+            checkpoint_head: None,
             fork_generation: None,
             fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,
@@ -942,6 +1016,14 @@ impl VmRecord {
         if self.source_smolmachine.is_some() {
             return Ok(());
         }
+        // A live-checkpoint restore resumes a guest whose image was pulled long
+        // ago: its RAM and disks come from the artifact and nothing is fetched.
+        // `image` is provenance here too. Without this, an offline machine could
+        // be checkpointed but never restored, which forced sandboxes that pause
+        // to keep a network device they otherwise have no use for.
+        if self.host_uid_owner.is_some() {
+            return Ok(());
+        }
         let Some(image) = self.image.as_deref() else {
             return Ok(());
         };
@@ -958,11 +1040,7 @@ impl VmRecord {
         ) {
             return Ok(());
         }
-        let plan = crate::network::plan_launch_network(
-            &self.vm_resources(),
-            self.dns_filter_hosts.as_deref(),
-            self.ports.len(),
-        );
+        let plan = self.launch_network_plan();
         if plan.has_network() {
             return Ok(());
         }
@@ -993,11 +1071,7 @@ impl VmRecord {
                  the workload container's mount namespace",
             ));
         }
-        let plan = crate::network::plan_launch_network(
-            &self.vm_resources(),
-            self.dns_filter_hosts.as_deref(),
-            self.ports.len(),
-        );
+        let plan = self.launch_network_plan();
         if !plan.has_network() {
             return Err(crate::Error::config(
                 "create machine",
@@ -1005,6 +1079,19 @@ impl VmRecord {
             ));
         }
         Ok(())
+    }
+
+    /// The network this machine launches with. A credential policy steers the
+    /// default backend to virtio-net, so anything that records or checks the
+    /// backend (validation, checkpoint capture) must plan it the same way the
+    /// launcher does, or a restore rebuilds a different device set.
+    pub fn launch_network_plan(&self) -> crate::network::LaunchNetworkPlan {
+        crate::network::plan_launch_network_with(
+            &self.vm_resources(),
+            self.dns_filter_hosts.as_deref(),
+            self.ports.len(),
+            self.credential_policy.is_some(),
+        )
     }
 
     /// Convert record fields to VmResources.
@@ -1022,9 +1109,11 @@ impl VmRecord {
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
             block_io: self.block_io,
+            disks: self.disks.clone(),
             allowed_cidrs: self.allowed_cidrs.clone(),
             dns: self.dns,
             network_name: self.network_name.clone(),
+            guest_subnet: self.guest_subnet.clone(),
         }
     }
 }
@@ -1125,6 +1214,15 @@ mod tests {
     }
 
     #[test]
+    fn a_checkpoint_restore_needs_no_network_even_though_it_names_a_registry_image() {
+        // A restored guest's RAM and disks come from the checkpoint; `image` is
+        // provenance. Rejecting it made offline machines impossible to restore.
+        let mut r = rec_with_image("alpine:3.20", false, vec![]);
+        r.host_uid_owner = Some("restored".to_string());
+        assert!(r.validate_image_fetchable().is_ok());
+    }
+
+    #[test]
     fn a_registry_image_with_no_network_is_still_rejected_without_an_artifact() {
         // The guard #807 added must survive the fix above: no artifact source,
         // no network, registry ref → still a create-time rejection.
@@ -1135,7 +1233,7 @@ mod tests {
 
     #[test]
     fn test_vm_record_serialization() {
-        let record = VmRecord::new(
+        let mut record = VmRecord::new(
             "test".to_string(),
             2,
             512,
@@ -1148,6 +1246,12 @@ mod tests {
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, record.name);
         assert_eq!(deserialized.mounts, record.mounts);
+        assert!(!deserialized.external_interceptor_required);
+
+        record.external_interceptor_required = true;
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.external_interceptor_required);
     }
 
     #[test]
@@ -1483,6 +1587,38 @@ mod tests {
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.storage_gb, Some(50));
         assert_eq!(deserialized.overlay_gb, Some(20));
+    }
+
+    /// Attached disks must survive the record: `start` re-attaches from the
+    /// record, so a disk that round-trips badly silently disappears on restart.
+    #[test]
+    fn attached_disks_round_trip_and_default_to_empty() {
+        let legacy = r#"{"name":"legacy"}"#;
+        let record: VmRecord = serde_json::from_str(legacy).unwrap();
+        assert!(
+            record.disks.is_empty(),
+            "a record predating --disk has none"
+        );
+
+        let mut record = VmRecord::new("db".to_string(), 2, 512, vec![], vec![], false);
+        record.disks = vec![
+            crate::data::disk::AttachedDisk {
+                path: std::path::PathBuf::from("/dev/nvme1n1"),
+                read_only: false,
+            },
+            crate::data::disk::AttachedDisk {
+                path: std::path::PathBuf::from("/srv/golden.img"),
+                read_only: true,
+            },
+        ];
+        let decoded: VmRecord =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert_eq!(decoded.disks, record.disks, "order and mode are preserved");
+        assert_eq!(
+            decoded.vm_resources().disks,
+            record.disks,
+            "and they reach the launcher through vm_resources()"
+        );
     }
 
     #[test]

@@ -51,6 +51,35 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve the host SSH-agent socket when forwarding is requested.
+fn resolve_ssh_agent_socket(enabled: bool) -> smolvm::Result<Option<PathBuf>> {
+    resolve_ssh_agent_socket_value(enabled, std::env::var_os("SSH_AUTH_SOCK"))
+}
+
+/// Resolve SSH-agent forwarding from an explicit environment value.
+///
+/// Keeping the environment lookup separate makes the launch-time contract
+/// testable without mutating the process environment.
+fn resolve_ssh_agent_socket_value(
+    enabled: bool,
+    socket: Option<std::ffi::OsString>,
+) -> smolvm::Result<Option<PathBuf>> {
+    if !enabled {
+        return Ok(None);
+    }
+
+    socket
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .map(Some)
+        .ok_or_else(|| {
+            Error::config(
+                "--ssh-agent",
+                "SSH_AUTH_SOCK is not set. Start an SSH agent with: eval $(ssh-agent) && ssh-add",
+            )
+        })
+}
+
 /// Resolve the agent-ready timeout, honoring `SMOLVM_AGENT_READY_TIMEOUT_SECS`.
 fn agent_ready_timeout() -> Duration {
     let secs = std::env::var("SMOLVM_AGENT_READY_TIMEOUT_SECS")
@@ -247,6 +276,10 @@ pub struct PackRunCmd {
     #[arg(long = "net-backend", value_enum, help_heading = "Network")]
     pub net_backend: Option<NetworkBackend>,
 
+    /// Forward the host SSH agent into the VM via a vsock bridge.
+    #[arg(long, help_heading = "Security")]
+    pub ssh_agent: bool,
+
     /// Number of virtual CPUs (overrides manifest default)
     #[arg(long, value_name = "N", help_heading = "Resources")]
     pub cpus: Option<u8>,
@@ -280,6 +313,14 @@ pub struct PackRunCmd {
     #[arg(long)]
     pub debug: bool,
 
+    /// The sidecar is an image cache this engine baked for itself
+    /// (`machine run --oci-cache`), not a pack someone published. It carries
+    /// the agent of whichever engine baked it, but boots this engine's own
+    /// agent, so the layer decisions are made for that agent and an entry
+    /// staged by an older engine gets its layers unpacked on the host.
+    #[arg(skip)]
+    pub local_bake: bool,
+
     /// Enable CUDA-over-vsock: run a host CUDA server and bridge the guest's
     /// CUDA client to it. Also enabled automatically when the packed machine
     /// was created with CUDA, or via `SMOLVM_CUDA=1`.
@@ -297,6 +338,15 @@ pub struct PackRunCmd {
     /// manifest-driven behavior.
     #[clap(skip)]
     pub egress: Option<ResolvedEgressPolicy>,
+
+    /// Secret refs the LOCAL caller supplied on the CLI (`--secret-env` /
+    /// `--secret-file`), keyed by guest env var. `machine run` sets these when it
+    /// serves a run through this command; a direct `pack run` carries none. They
+    /// are resolved `TrustedLocal` at exec — distinct from the manifest's own
+    /// refs, which stay `Untrusted` — so the caller's own env/files resolve while
+    /// a portable artifact's refs still cannot. Not a CLI flag.
+    #[clap(skip)]
+    pub secret_refs: std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
 }
 
 /// Network policy resolved from `--allow-cidr`/`--allow-host`/
@@ -429,17 +479,19 @@ impl PackRunCmd {
                 ));
             }
         }
+        let ssh_agent_socket = resolve_ssh_agent_socket(self.ssh_agent)?;
 
         // 6. Extract assets to cache (locked to prevent concurrent extraction races)
         let cache_dir = extract::get_cache_dir(footer.checksum)
             .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
-        extract::extract_sidecar(
+        extract::extract_sidecar_for_agent(
             &sidecar_path,
             &cache_dir,
             &footer,
             self.force_extract,
             self.debug,
+            self.local_bake.then_some(smolvm::VERSION),
         )
         .map_err(|e| Error::agent("extract assets", e.to_string()))?;
 
@@ -447,7 +499,14 @@ impl PackRunCmd {
         //    concurrent runs of the same checksum don't conflict on
         //    storage.ext4 / agent.sock.  tempdir_in gives us a truly unique
         //    directory that survives PID reuse and abrupt termination.
-        let rootfs_path = cache_dir.join("agent-rootfs");
+        // A locally baked image cache boots this engine's agent: the packed one
+        // is whatever engine baked it, and the layer decisions above were made
+        // for the engine's. A published pack keeps the agent it shipped with.
+        let rootfs_path = if self.local_bake {
+            smolvm::agent::AgentManager::default_rootfs_path()?
+        } else {
+            cache_dir.join("agent-rootfs")
+        };
         let lib_dir = resolve_lib_dir(&cache_dir, self.debug)?;
         let layers_lease = extract::acquire_layers_lease(&cache_dir, self.debug)
             .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
@@ -512,12 +571,14 @@ impl PackRunCmd {
             network_backend: self.net_backend,
             dns: None,
             network_name: None,
+            guest_subnet: None,
             gpu: manifest.gpu,
             nested_virt: false,
             cuda: cuda_enabled,
             storage_gib,
             overlay_gib: self.overlay,
             block_io: self.block_io.unwrap_or_default(),
+            disks: Vec::new(),
             gpu_vram_mib: None,
             rosetta: false,
             allowed_cidrs: self
@@ -592,6 +653,7 @@ impl PackRunCmd {
                     } else {
                         None
                     },
+                    ssh_agent_socket: ssh_agent_socket.as_deref(),
                     dns_filter_hosts,
                 };
 
@@ -647,7 +709,7 @@ impl PackRunCmd {
                 mounts: mounts.clone(),
                 ports: ports.clone(),
                 resources: resources.clone(),
-                ssh_agent_socket: None,
+                ssh_agent_socket,
                 cuda: false,
                 expose_docker: false,
                 published_sockets: Vec::new(),
@@ -659,6 +721,8 @@ impl PackRunCmd {
                 pack_idmap_source: None,
                 extra_disks: vec![],
                 pod_netns: None,
+                credentials: None,
+                external_interceptor: None,
             };
 
             let config_path = runtime_dir.path().join("boot-config.json");
@@ -1029,12 +1093,13 @@ pub(crate) fn resolve_packed_launch(
     manifest: &smolvm_pack::PackManifest,
     cli_command: &[String],
     cli_env: &[String],
+    cli_secret_refs: &std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
     cli_workdir: Option<String>,
     cli_user: Option<String>,
 ) -> smolvm::Result<PackedLaunch> {
     Ok(PackedLaunch {
         command: build_command(manifest, cli_command),
-        env: build_env(manifest, cli_env)?,
+        env: build_env(manifest, cli_env, cli_secret_refs)?,
         workdir: cli_workdir.or_else(|| manifest.workdir.clone()),
         user: cli_user.or_else(|| manifest.user.clone()),
     })
@@ -1044,6 +1109,7 @@ pub(crate) fn resolve_packed_launch(
 fn build_env(
     manifest: &smolvm_pack::PackManifest,
     cli_env: &[String],
+    cli_secret_refs: &std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
 ) -> smolvm::Result<Vec<(String, String)>> {
     let mut env: Vec<(String, String)> = manifest
         .env
@@ -1074,6 +1140,21 @@ fn build_env(
             smolvm::secrets::ResolutionScope::Untrusted,
         )?,
     ));
+
+    // Secrets the local caller passed on the CLI (`--secret-env`/`--secret-file`)
+    // are their own, so resolve them `TrustedLocal` — the scope the manifest's
+    // refs are denied. They override a manifest env/secret of the same key
+    // (explicit caller intent beats the baked artifact); an explicit `--env`
+    // below still wins over a `--secret-env` of the same name. Without this the
+    // cached/pack-run path silently dropped CLI secrets that the direct
+    // `machine run` path honors.
+    for (key, value) in smolvm::secrets::expose_into_env(smolvm::secrets::resolve_refs_to_env(
+        cli_secret_refs,
+        smolvm::secrets::ResolutionScope::TrustedLocal,
+    )?) {
+        env.retain(|(k, _)| k != &key);
+        env.push((key, value));
+    }
 
     // CLI env overrides manifest env and resolved secrets
     for spec in cli_env {
@@ -1106,6 +1187,7 @@ fn execute_command(
         manifest,
         &args.command,
         &args.env,
+        &args.secret_refs,
         args.workdir.clone(),
         args.user.clone(),
     )?;
@@ -1310,6 +1392,10 @@ struct PackedRunArgs {
     #[arg(long = "net-backend", value_enum)]
     net_backend: Option<NetworkBackend>,
 
+    /// Forward the host SSH agent into the VM via a vsock bridge.
+    #[arg(long)]
+    ssh_agent: bool,
+
     /// Number of vCPUs (overrides default)
     #[arg(long, value_name = "N")]
     cpus: Option<u8>,
@@ -1380,6 +1466,10 @@ struct PackedStartArgs {
     /// Select the networking backend.
     #[arg(long = "net-backend", value_enum)]
     net_backend: Option<NetworkBackend>,
+
+    /// Forward the host SSH agent into the VM via a vsock bridge.
+    #[arg(long)]
+    ssh_agent: bool,
 }
 
 /// Arguments for the `exec` subcommand (run in existing VM).
@@ -1517,6 +1607,7 @@ fn run_ephemeral(
             // Construct PackRunCmd from PackedRunArgs and delegate to existing path
             let cmd = PackRunCmd {
                 sidecar: Some(sidecar_path),
+                local_bake: false,
                 command: args.command,
                 interactive: args.interactive,
                 tty: args.tty,
@@ -1529,6 +1620,7 @@ fn run_ephemeral(
                 port: args.port,
                 net: args.net,
                 net_backend: args.net_backend,
+                ssh_agent: args.ssh_agent,
                 cpus: args.cpus,
                 mem: args.mem,
                 storage: args.storage,
@@ -1540,6 +1632,8 @@ fn run_ephemeral(
                 debug,
                 cuda: args.cuda,
                 auto_graph: false,
+                // A standalone packed binary carries no CLI secret refs.
+                secret_refs: Default::default(),
             };
             cmd.run()
         }
@@ -1639,6 +1733,7 @@ fn run_from_cache(
     let vsock_path = runtime_dir.path().join("agent.sock");
 
     let storage_gib = storage_gib_for_manifest(args.storage, manifest);
+    let ssh_agent_socket = resolve_ssh_agent_socket(args.ssh_agent)?;
 
     let template = manifest
         .assets
@@ -1672,12 +1767,14 @@ fn run_from_cache(
         network_backend: args.net_backend,
         dns: None,
         network_name: None,
+        guest_subnet: None,
         gpu: manifest.gpu,
         nested_virt: false,
         cuda: manifest.cuda,
         storage_gib,
         overlay_gib: args.overlay,
         block_io: args.block_io.unwrap_or_default(),
+        disks: Vec::new(),
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
@@ -1714,6 +1811,7 @@ fn run_from_cache(
             // CUDA-over-vsock for the persistent/daemon packed paths is not
             // wired yet; the `run` path starts the host server.
             cuda_socket: None,
+            ssh_agent_socket: ssh_agent_socket.as_deref(),
             // Packed binaries carry no egress flags; policy comes only from a
             // `machine run` hand-off.
             dns_filter_hosts: None,
@@ -1763,7 +1861,7 @@ fn run_from_cache(
             mounts: mounts.clone(),
             ports: ports.clone(),
             resources: resources.clone(),
-            ssh_agent_socket: None,
+            ssh_agent_socket,
             cuda: false,
             expose_docker: false,
             published_sockets: Vec::new(),
@@ -1772,6 +1870,8 @@ fn run_from_cache(
             pack_idmap_source: None,
             extra_disks: vec![],
             pod_netns: None,
+            credentials: None,
+            external_interceptor: None,
         };
         let config_path = runtime_dir.path().join("boot-config.json");
         let config_json = serde_json::to_vec(&boot_config)
@@ -1843,7 +1943,14 @@ fn run_from_cache(
     let mut client = wait_for_agent(&vsock_path, debug)?;
 
     let params = ExecParams {
-        launch: resolve_packed_launch(manifest, &args.command, &args.env, args.workdir, args.user)?,
+        launch: resolve_packed_launch(
+            manifest,
+            &args.command,
+            &args.env,
+            &std::collections::BTreeMap::new(),
+            args.workdir,
+            args.user,
+        )?,
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,
@@ -2045,6 +2152,7 @@ fn daemon_start(
         println!("Daemon already running (PID: {})", pid);
         return Ok(());
     }
+    let ssh_agent_socket = resolve_ssh_agent_socket(args.ssh_agent)?;
 
     // Clean up stale PID/socket files from previous runs
     if let Err(e) = std::fs::remove_file(daemon.join("agent.pid")) {
@@ -2096,12 +2204,14 @@ fn daemon_start(
         network_backend: args.net_backend,
         dns: None,
         network_name: None,
+        guest_subnet: None,
         gpu: manifest.gpu,
         nested_virt: false,
         cuda: manifest.cuda,
         storage_gib,
         overlay_gib: args.overlay,
         block_io: args.block_io.unwrap_or_default(),
+        disks: Vec::new(),
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: None,
@@ -2161,6 +2271,7 @@ fn daemon_start(
             // CUDA-over-vsock for the persistent/daemon packed paths is not
             // wired yet; the `run` path starts the host server.
             cuda_socket: None,
+            ssh_agent_socket: ssh_agent_socket.as_deref(),
             // Packed binaries carry no egress flags; policy comes only from a
             // `machine run` hand-off.
             dns_filter_hosts: None,
@@ -2261,7 +2372,14 @@ fn daemon_exec(
     // Virtiofs devices are fixed at boot — exec cannot add new host mounts.
     let mounts: Vec<smolvm::data::storage::HostMount> = Vec::new();
     let params = ExecParams {
-        launch: resolve_packed_launch(manifest, &args.command, &args.env, args.workdir, args.user)?,
+        launch: resolve_packed_launch(
+            manifest,
+            &args.command,
+            &args.env,
+            &std::collections::BTreeMap::new(),
+            args.workdir,
+            args.user,
+        )?,
         interactive: args.interactive,
         tty: args.tty,
         timeout: args.timeout,
@@ -2379,6 +2497,62 @@ fn daemon_status(checksum: u32) -> smolvm::Result<()> {
 mod tests {
     use super::*;
 
+    /// Regression for #1315: CLI `--secret-env`/`--secret-file` refs must reach
+    /// the workload env when a run is served through the pack-run path (e.g.
+    /// `--oci-cache`), resolved TrustedLocal — where the manifest's own refs are
+    /// denied. Before the fix these CLI secrets were silently dropped.
+    #[test]
+    fn cli_secret_refs_resolve_and_override_manifest_env() {
+        use std::collections::BTreeMap;
+        // Unique name so parallel tests don't collide on process-global env.
+        let src = "GATE_1315_SECRET_SRC";
+        std::env::set_var(src, "hunter2");
+
+        let mut manifest = smolvm_pack::PackManifest::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        // A manifest env the CLI secret of the same key must override.
+        manifest.env = vec!["KEK=from-manifest".to_string()];
+
+        let mut cli_secret_refs: BTreeMap<String, smolvm::secrets::SecretRef> = BTreeMap::new();
+        cli_secret_refs.insert("KEK".to_string(), smolvm::secrets::env_ref(src));
+
+        let env = build_env(&manifest, &[], &cli_secret_refs).expect("build_env");
+        let kek: Vec<&String> = env
+            .iter()
+            .filter(|(k, _)| k == "KEK")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            kek,
+            vec!["hunter2"],
+            "CLI secret resolves and overrides manifest env"
+        );
+
+        // An explicit --env still wins over a --secret-env of the same key.
+        let env2 = build_env(
+            &manifest,
+            &["KEK=from-cli-env".to_string()],
+            &cli_secret_refs,
+        )
+        .expect("build_env");
+        let kek2: Vec<&String> = env2
+            .iter()
+            .filter(|(k, _)| k == "KEK")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            kek2,
+            vec!["from-cli-env"],
+            "explicit --env beats --secret-env"
+        );
+
+        std::env::remove_var(src);
+    }
+
     #[test]
     fn resolved_policy_decides_network_instead_of_the_baked_manifest() {
         // The baked artifact's manifest records the bake VM's networking
@@ -2417,5 +2591,25 @@ mod tests {
         assert!(effective_network(None, true, false, false));
         assert!(effective_network(None, false, true, false));
         assert!(effective_network(None, false, false, true));
+    }
+
+    #[test]
+    fn ssh_agent_forwarding_is_disabled_without_flag() {
+        assert_eq!(resolve_ssh_agent_socket_value(false, None).unwrap(), None);
+    }
+
+    #[test]
+    fn ssh_agent_forwarding_requires_a_host_socket() {
+        let error = resolve_ssh_agent_socket_value(true, None).unwrap_err();
+        assert!(error.to_string().contains("SSH_AUTH_SOCK"));
+    }
+
+    #[test]
+    fn ssh_agent_forwarding_uses_the_host_socket_path() {
+        let socket = std::ffi::OsString::from("/tmp/ssh-agent.sock");
+        assert_eq!(
+            resolve_ssh_agent_socket_value(true, Some(socket)).unwrap(),
+            Some(PathBuf::from("/tmp/ssh-agent.sock"))
+        );
     }
 }

@@ -5,7 +5,9 @@
 //! that records when it was last read. LRU eviction keeps total size under a
 //! configurable limit — default 5 GB, override with `SMOLVM_BLOB_CACHE_MAX_BYTES`.
 
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Default maximum blob-cache size when `SMOLVM_BLOB_CACHE_MAX_BYTES` is unset: 5 GB.
@@ -139,6 +141,48 @@ impl BlobCache {
         Ok(path)
     }
 
+    /// Import a local artifact without loading it into memory. The copied bytes
+    /// must match `digest` before they become visible to cache readers.
+    pub fn put_file_verified(&self, digest: &str, source: &Path) -> io::Result<PathBuf> {
+        if let Some(path) = self.get(digest) {
+            return Ok(path);
+        }
+        let mut source = fs::File::open(source)?;
+        // A `.partial` file is excluded from eviction until it is published.
+        let mut staged = tempfile::Builder::new()
+            .suffix(".partial")
+            .tempfile_in(&self.root)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 1024 * 1024];
+        let mut size = 0u64;
+        loop {
+            let count = source.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            staged.write_all(&buffer[..count])?;
+            hasher.update(&buffer[..count]);
+            size += count as u64;
+        }
+        if digest != format!("sha256:{:x}", hasher.finalize()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "local pack digest changed while caching",
+            ));
+        }
+        staged.as_file().sync_all()?;
+        let path = self.blob_path(digest);
+        let current = self.total_size()?;
+        if current.saturating_add(size) > self.max_size {
+            self.evict_until(self.max_size.saturating_sub(size))?;
+        }
+        match staged.persist_noclobber(&path) {
+            Ok(_) => Ok(path),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(path),
+            Err(error) => Err(error.error),
+        }
+    }
+
     /// Total size of all cached blobs in bytes.
     pub fn total_size(&self) -> std::io::Result<u64> {
         let mut total = 0u64;
@@ -266,6 +310,29 @@ mod tests {
 
         // Hit after put.
         assert!(cache.get(digest).is_some());
+    }
+
+    #[test]
+    fn local_file_import_is_content_addressed_and_independent_of_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        // An artifact larger than the cache cap must still publish; its staging
+        // file must never be mistaken for an evictable blob.
+        let cache = BlobCache::open(tmp.path().join("cache"), 8).unwrap();
+        let source = tmp.path().join("pack.smolmachine");
+        fs::write(&source, b"packed layers").unwrap();
+        let digest = format!("sha256:{:x}", Sha256::digest(b"packed layers"));
+        let wrong = format!("sha256:{:x}", Sha256::digest(b"other layers"));
+
+        assert_eq!(
+            cache.put_file_verified(&wrong, &source).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(cache.get(&wrong).is_none());
+
+        let cached = cache.put_file_verified(&digest, &source).unwrap();
+        fs::remove_file(&source).unwrap();
+        assert_eq!(fs::read(&cached).unwrap(), b"packed layers");
+        assert_eq!(cache.get(&digest), Some(cached));
     }
 
     #[test]
@@ -418,6 +485,74 @@ mod tests {
         );
         assert!(!lru_marker_path(&pb).exists(), "its marker goes with it");
         assert!(cache.get(c).is_some());
+    }
+
+    /// `last_used` is where the upgrade path lives: a blob cached before
+    /// markers existed has none, and its recency must come from the atime the
+    /// old scheme maintained rather than collapsing to the epoch.
+    #[test]
+    fn last_used_falls_back_to_atime_when_no_marker_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let blob = cache.put(digest, b"payload").unwrap();
+        let atime = filetime::FileTime::from_unix_time(1_600_000_500, 0);
+        filetime::set_file_atime(&blob, atime).unwrap();
+        assert!(!lru_marker_path(&blob).exists());
+
+        let from_atime = last_used(&blob, &fs::metadata(&blob).unwrap());
+        assert_ne!(
+            from_atime,
+            std::time::UNIX_EPOCH,
+            "a pre-marker blob must not read as epoch-old"
+        );
+        assert_eq!(
+            from_atime,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_500)
+        );
+
+        note_used(&blob);
+        let marker = filetime::FileTime::from_unix_time(1_600_009_000, 0);
+        filetime::set_file_mtime(lru_marker_path(&blob), marker).unwrap();
+        assert_eq!(
+            last_used(&blob, &fs::metadata(&blob).unwrap()),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_009_000),
+            "once a marker exists it is the authority"
+        );
+    }
+
+    /// An upgraded node holds a mix: blobs read since the upgrade have markers,
+    /// the rest carry only their old atime. Eviction must order the two kinds
+    /// against each other, or the untouched-but-hot half of a warm cache is
+    /// thrown away first and re-pulled.
+    #[test]
+    fn eviction_orders_pre_marker_blobs_against_marked_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 250).unwrap();
+        let unmarked = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let marked = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let fresh = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+        let unmarked_path = cache.put(unmarked, &[0u8; 100]).unwrap();
+        let marked_path = cache.put(marked, &[0u8; 100]).unwrap();
+        let t = |secs: i64| filetime::FileTime::from_unix_time(1_600_000_000 + secs, 0);
+        // Pre-marker blob, read recently under the old scheme.
+        filetime::set_file_atime(&unmarked_path, t(900)).unwrap();
+        assert!(!lru_marker_path(&unmarked_path).exists());
+        // Marked blob, last read long before that.
+        note_used(&marked_path);
+        filetime::set_file_mtime(lru_marker_path(&marked_path), t(1)).unwrap();
+
+        cache.put(fresh, &[0u8; 100]).unwrap();
+
+        assert!(
+            cache.get(unmarked).is_some(),
+            "a pre-marker blob read recently outranks a marked blob read long ago"
+        );
+        assert!(
+            cache.get(marked).is_none(),
+            "the genuinely least recently used blob is the one evicted"
+        );
+        assert!(cache.get(fresh).is_some());
     }
 
     #[test]

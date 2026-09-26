@@ -144,14 +144,50 @@ pub fn get_record(db: &SmolvmDb, name: &str) -> Result<VmRecord> {
 /// booted/restarted it. Callers use the status to launch image workloads exactly
 /// once: a reused VM already has its workload, while a restarted VM does not.
 pub(crate) fn start_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> {
+    start_vm_with_interceptor(db, name, None)
+}
+
+/// Start with a per-launch interceptor binding. The token is never stored in the DB.
+pub(crate) fn start_vm_with_interceptor(
+    db: &SmolvmDb,
+    name: &str,
+    interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+) -> Result<StartedVm> {
     let record = get_record(db, name)?;
-    let started = start_vm_from_record(&record)?;
+    let started = launch_from_record(
+        &record,
+        LaunchFeatures {
+            external_interceptor: interceptor,
+            ..Default::default()
+        },
+    )?;
     mark_running(db, name, started.handle.child_pid())?;
     Ok(started)
 }
 
-fn start_vm_from_record(record: &VmRecord) -> Result<StartedVm> {
-    launch_from_record(record, LaunchFeatures::default())
+pub(crate) fn resume_vm(db: &SmolvmDb, name: &str, detached: bool) -> Result<StartedVm> {
+    let record = get_record(db, name)?;
+    let started = launch_from_record(
+        &record,
+        LaunchFeatures {
+            resume_paused: true,
+            watch_parent: detached.then_some(false),
+            // A same-machine restore keeps its existing owner, rather than
+            // inferring a new UID from the temporary snapshot's directory depth.
+            uid_share_dir: Some(crate::agent::vm_data_dir(name)),
+            ..Default::default()
+        },
+    )?;
+    let pid = started.handle.child_pid();
+    let pid_start_time = pid.and_then(crate::process::process_start_time);
+    db.finish_saved_execution(name, |record| {
+        record.state = RecordState::Running;
+        record.pid = pid;
+        record.pid_start_time = pid_start_time;
+        record.paused_checkpoint = None;
+    })?
+    .ok_or_else(|| Error::vm_not_found(name))?;
+    Ok(started)
 }
 
 fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures) -> LaunchFeatures {
@@ -199,6 +235,13 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
     }
     if features.cuda_fork_pool_size.is_none() {
         features.cuda_fork_pool_size = record.cuda_fork_pool_size;
+    }
+    // Credential bindings are part of the launch too: without them the guest's
+    // placeholders go out unsubstituted, and a paused machine's snapshot — which
+    // holds the credential CA's virtio-fs device — can no longer be restored.
+    if features.credentials.is_none() {
+        features.credentials =
+            crate::credentials::CredentialLaunch::for_record(&record.name, record);
     }
     if features.cuda_vram_limit_mib.is_none() {
         features.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
@@ -317,6 +360,7 @@ pub(crate) fn fork_vm_with_options(
         clone_forkable,
         &[],
         &std::collections::BTreeMap::new(),
+        crate::agent::fork::ForkSourcePolicy::PlatformDefault,
     )?;
 
     boot_prepared_fork(db, clone, prep, share_weights, watch_parent, None)
@@ -437,7 +481,12 @@ pub fn fork_vm_batch(
             hold: false,
         })
         .collect();
-    let prepared = crate::agent::fork::prepare_forks(db, golden, &specs)?;
+    let prepared = crate::agent::fork::prepare_forks(
+        db,
+        golden,
+        &specs,
+        crate::agent::fork::ForkSourcePolicy::PlatformDefault,
+    )?;
     let width = parallel.max(1).min(prepared.len());
     let queue = std::sync::Mutex::new(std::collections::VecDeque::from(
         prepared.into_iter().enumerate().collect::<Vec<_>>(),

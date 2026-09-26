@@ -122,6 +122,14 @@ pub struct ResourceSpec {
     /// them by name. Combine with `allowed_cidrs` to also permit fixed ranges.
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
+    /// Credential bindings substituted by the host: the workload receives a
+    /// placeholder in each `environment_variable` and the real value is
+    /// injected only on HTTPS requests to that binding's `allowed_hosts`.
+    /// Values are never part of the request; the host resolves each binding
+    /// from its own secret store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub credentials: Option<smolvm_protocol::CredentialPolicy>,
     /// Network backend: `tsi` (outbound-only) or `virtio-net`.
     ///
     /// When omitted the backend is chosen from context: machines managed by
@@ -132,6 +140,13 @@ pub struct ResourceSpec {
     /// lighter outbound-only backend (rejected alongside published `ports`).
     #[serde(default)]
     pub network_backend: Option<crate::network::NetworkBackend>,
+    /// IPv4 subnet the guest link is drawn from (virtio-net only), e.g.
+    /// `10.200.0.0/30`. The gateway and the guest's resolver take the first host
+    /// address and the guest the second. Omit for the default `100.96.0.0/30`,
+    /// which collides with Tailscale or carrier NAT running inside the guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "10.200.0.0/30")]
+    pub guest_subnet: Option<String>,
 }
 
 // ============================================================================
@@ -617,6 +632,12 @@ pub struct CreateMachineRequest {
     /// names are learned into the egress allow-list.
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
+    /// Credential bindings substituted by the host on the way out (see
+    /// `ResourceSpec::credentials`). Placeholders replace the values in the
+    /// workload environment; the request never carries a credential value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub credentials: Option<smolvm_protocol::CredentialPolicy>,
     /// Network backend: `tsi` (outbound-only) or `virtio-net`.
     ///
     /// When omitted, machines created through the API default to `virtio-net`:
@@ -628,6 +649,13 @@ pub struct CreateMachineRequest {
     /// path), so that combination is rejected.
     #[serde(default)]
     pub network_backend: Option<crate::network::NetworkBackend>,
+    /// IPv4 subnet the guest link is drawn from (virtio-net only), e.g.
+    /// `10.200.0.0/30`. The gateway and the guest's resolver take the first host
+    /// address and the guest the second. Omit for the default `100.96.0.0/30`,
+    /// which collides with Tailscale or carrier NAT running inside the guest.
+    #[serde(default)]
+    #[schema(example = "10.200.0.0/30")]
+    pub guest_subnet: Option<String>,
     /// Restart policy configuration.
     #[serde(default)]
     pub restart: Option<RestartSpec>,
@@ -962,6 +990,63 @@ pub struct StartMachineRequest {
     /// fails with an opaque DENIED.
     #[serde(default)]
     pub registry_auth: Option<RegistryAuthSpec>,
+
+    /// External host egress interceptor for this start. The token remains on
+    /// the API server only and is never written to the machine record.
+    #[serde(default)]
+    pub egress_interceptor: Option<ExternalInterceptorSpec>,
+}
+
+/// Host interceptor binding supplied in a machine start request.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalInterceptorSpec {
+    /// Loopback listener address, for example `127.0.0.1:43123`.
+    #[schema(value_type = String)]
+    pub address: std::net::SocketAddr,
+    /// Authentication token shared with the interceptor, as 64 hex digits.
+    #[serde(deserialize_with = "deserialize_interceptor_token")]
+    #[schema(value_type = String)]
+    pub token: crate::secrets::Secret,
+}
+
+fn deserialize_interceptor_token<'de, D>(
+    deserializer: D,
+) -> Result<crate::secrets::Secret, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(crate::secrets::Secret::new)
+}
+
+impl ExternalInterceptorSpec {
+    /// Decode the token supplied by the caller into the launch protocol type.
+    pub fn endpoint(&self) -> Result<smolvm_protocol::InterceptEndpoint, &'static str> {
+        let mut token = [0; smolvm_protocol::intercept::TOKEN_LEN];
+        if hex::decode_to_slice(self.token.expose(), &mut token).is_err() || token == [0; 32] {
+            return Err("egressInterceptor.token must contain 64 nonzero hex digits");
+        }
+        Ok(smolvm_protocol::InterceptEndpoint {
+            addr: self.address,
+            token,
+        })
+    }
+}
+
+/// Values for a machine's credential bindings, by binding name.
+///
+/// Held in the server's memory only — never written to the machine record,
+/// a checkpoint or disk — and applied at the machine's next boot (start,
+/// resume or restore). A server restart forgets them, so supply them again
+/// before each start. A machine whose bindings came in over this API resolves
+/// them from here and nowhere else.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialValuesRequest {
+    /// Binding name → value. Replaces whatever was supplied before; empty
+    /// clears it.
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, String>,
 }
 
 /// Request to branch a running, branchable source machine into a new child.
@@ -995,6 +1080,9 @@ pub struct ForkRequest {
     /// fork-release endpoint after assigning job-specific parameters.
     #[serde(default)]
     pub hold: bool,
+    /// Keep the source paused as a reusable branch base.
+    #[serde(default)]
+    pub freeze_source: bool,
     /// Maximum seconds to wait for the golden workload's forkpoint. Defaults
     /// to 240 when `waitReady` or `hold` is enabled.
     #[serde(default)]
@@ -1059,6 +1147,9 @@ pub struct CreateForkPoolRequest {
     /// Share immutable CUDA allocations with the golden and sibling workers.
     #[serde(default)]
     pub share_weights: bool,
+    /// Keep the source paused while this pool is replenished from its checkpoint.
+    #[serde(default)]
+    pub freeze_source: bool,
     /// Maximum seconds to wait for the golden workload forkpoint.
     #[serde(default)]
     pub ready_timeout_secs: Option<u64>,
@@ -1104,6 +1195,8 @@ pub struct ForkPoolInfo {
     pub golden: String,
     /// Configured clean-worker target.
     pub desired_ready: u32,
+    /// Whether this pool keeps its source paused for repeated branches.
+    pub freeze_source: bool,
     /// Optional simultaneous active-lease limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_active: Option<u32>,
@@ -1197,6 +1290,12 @@ pub struct AcquireForkLeaseRequest {
     /// Optional fused-rollout access granted only to this lease's executor and policy.
     #[serde(default)]
     pub rollout_access: Option<RolloutLeaseAccess>,
+    /// Wait up to this many seconds for a clean worker when none is ready,
+    /// instead of failing with 503 right away. Defaults to 0 (no wait). The
+    /// acquisition request can remain open for this duration, so clients must
+    /// use a longer request deadline.
+    #[serde(default)]
+    pub wait_secs: Option<u64>,
 }
 
 /// Preferred public name for [`AcquireForkLeaseRequest`].
@@ -1397,6 +1496,7 @@ mod registry_auth_tests {
         // And it must stay redacted when nested in the request struct.
         let req = StartMachineRequest {
             registry_auth: Some(spec),
+            egress_interceptor: None,
         };
         assert!(!format!("{req:?}").contains("ghp_super_secret_value"));
     }
@@ -1408,6 +1508,7 @@ mod registry_auth_tests {
     fn body_is_optional_and_backwards_compatible() {
         let empty: StartMachineRequest = serde_json::from_str("{}").unwrap();
         assert!(empty.registry_auth.is_none());
+        assert!(empty.egress_interceptor.is_none());
 
         let unrelated: StartMachineRequest =
             serde_json::from_str(r#"{"somethingElse":1}"#).unwrap();
@@ -1419,6 +1520,24 @@ mod registry_auth_tests {
         let auth = with_auth.registry_auth.expect("registryAuth parsed");
         assert_eq!(auth.username, "token");
         assert_eq!(auth.password, "pat");
+    }
+
+    #[test]
+    fn api_interceptor_token_is_validated_and_redacted() {
+        let token = "0123456789abcdef".repeat(4);
+        let body =
+            format!(r#"{{"egressInterceptor":{{"address":"127.0.0.1:43123","token":"{token}"}}}}"#);
+        let request: StartMachineRequest = serde_json::from_str(&body).unwrap();
+        assert!(!format!("{request:?}").contains(&token));
+        let endpoint = request.egress_interceptor.unwrap().endpoint().unwrap();
+        assert_eq!(endpoint.addr, "127.0.0.1:43123".parse().unwrap());
+        assert_ne!(endpoint.token, [0; smolvm_protocol::intercept::TOKEN_LEN]);
+
+        let invalid: StartMachineRequest = serde_json::from_str(
+            r#"{"egressInterceptor":{"address":"127.0.0.1:43123","token":"short"}}"#,
+        )
+        .unwrap();
+        assert!(invalid.egress_interceptor.unwrap().endpoint().is_err());
     }
 
     /// Converting into the protocol type preserves both fields verbatim — a
@@ -1442,7 +1561,25 @@ mod registry_auth_tests {
         .unwrap();
         assert!(!request.wait_ready);
         assert!(!request.hold);
+        assert!(!request.freeze_source);
         assert_eq!(request.ready_timeout_secs, None);
+    }
+
+    #[test]
+    fn branch_and_pool_accept_freeze_source() {
+        let branch: ForkRequest = serde_json::from_value(serde_json::json!({
+            "name": "child-1", "freezeSource": true
+        }))
+        .unwrap();
+        assert!(branch.freeze_source);
+        assert_eq!(serde_json::to_value(branch).unwrap()["freezeSource"], true);
+
+        let pool: CreateForkPoolRequest = serde_json::from_value(serde_json::json!({
+            "name": "workers", "source": "base", "desiredReady": 2,
+            "freezeSource": true
+        }))
+        .unwrap();
+        assert!(pool.freeze_source);
     }
 
     #[test]

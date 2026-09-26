@@ -331,6 +331,49 @@ pub enum PackMode {
     Vm,
 }
 
+/// Where a checkpoint sits in its machine's history.
+///
+/// Every capture is a node: `parent` is the checkpoint the source machine was
+/// last captured to or restored from, so repeated captures of one machine form
+/// a chain and a restore-then-capture forms a branch. Ids are random and
+/// unique per capture; they carry no content meaning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointLineage {
+    /// This checkpoint's id (32 lowercase hex characters).
+    pub id: String,
+    /// The checkpoint this one continues from, when the source had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Machine the state was captured from.
+    pub machine: String,
+    /// When the capture was published (RFC 3339).
+    pub created_at: String,
+}
+
+/// How a portable checkpoint file lays out its payload.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointLayout {
+    /// The classic single generation: the assets tarball holds the state,
+    /// memory image and disks directly.
+    #[default]
+    Assets,
+    /// A checkpoint store directory packed whole — content-addressed objects
+    /// plus one index per generation — so the file carries its history and
+    /// any generation in it can be restored.
+    Chunked,
+}
+
+/// One generation summarized in a checkpoint file's history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointGeneration {
+    /// Identity and parent of the generation.
+    #[serde(flatten)]
+    pub lineage: CheckpointLineage,
+    /// Bytes of actual data the generation describes.
+    pub data_bytes: u64,
+}
+
 /// One integrity-protected file belonging to a portable live checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointAsset {
@@ -421,12 +464,26 @@ pub struct CheckpointNetwork {
     /// Named local inter-VM network joined by the captured machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
+    /// Subnet of the captured guest link, when not the default. The restored
+    /// guest keeps its address in memory, so the host side must match it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_subnet: Option<String>,
     /// Captured outbound CIDR allow-list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_cidrs: Option<Vec<String>>,
     /// Captured outbound DNS hostname allow-list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// Captured credential bindings (`[[network.credentials]]`): binding names,
+    /// env-var names and allowed hosts — never the values, which the restore
+    /// host resolves from its own environment at request time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_policy: Option<smolvm_protocol::CredentialPolicy>,
+    /// Placeholders minted for `credential_policy` on the source machine.
+    /// Carried so a process captured holding its placeholder still matches the
+    /// restored interceptor; placeholders are opaque tokens, not secrets.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub credential_placeholders: std::collections::BTreeMap<String, String>,
 }
 
 /// Versioned host CPU compatibility contract for a live checkpoint.
@@ -511,6 +568,42 @@ pub struct PortableCheckpointManifest {
     /// Host networking reconstructed around the restored VM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<CheckpointNetwork>,
+    /// The `.smolmachine` whose image layers the captured machine mounted from
+    /// the host. They are not in the artifact, so a restore must attach the same
+    /// pack again to reproduce the captured device topology.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packed_layers: Option<CheckpointPackedLayers>,
+    /// Position in the source machine's checkpoint history. Absent on
+    /// checkpoints written before lineage was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<CheckpointLineage>,
+    /// Payload layout. `Chunked` files use a distinct format version so
+    /// runtimes that predate them refuse them clearly.
+    #[serde(default)]
+    pub payload: CheckpointLayout,
+    /// The generations a `Chunked` file carries, this one first. Empty for a
+    /// single-generation file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<CheckpointGeneration>,
+    /// The machine's credential CA (certificate and signing key). The captured
+    /// guest trusts this CA, so a restore keeps it instead of minting a new
+    /// one the guest would reject. Absent for machines without credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ca: Option<CheckpointAsset>,
+}
+
+/// Identity of the pack a checkpointed machine mounted its image layers from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointPackedLayers {
+    /// SHA-256 of the whole `.smolmachine` file (its registry blob digest),
+    /// lowercase hex without the `sha256:` prefix.
+    pub artifact_sha256: String,
+    /// The pack footer's checksum, which keys its extracted layers.
+    pub footer_checksum: u32,
+    /// Registry reference the machine was created from, for fetching the pack
+    /// on a host that does not already have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_ref: Option<String>,
 }
 
 /// Manifest describing the packed image and configuration.

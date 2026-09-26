@@ -3,7 +3,7 @@
 //!
 //! A fork snapshots a running, forkable machine's RAM, device state, and disks,
 //! gives the clone private copy-on-write layers, and lets the caller boot the
-//! clone from that exact boundary. Linux/x86_64 and macOS resume the source
+//! clone from that exact boundary. Linux and macOS resume the source
 //! immediately on new private layers; other hosts retain a frozen CoW base.
 //! The boot itself differs between callers (the CLI uses `start_vm_named`; the
 //! API uses `AgentManager`), so it stays out of here; everything up to and
@@ -93,6 +93,15 @@ impl ForkSourceLock {
 pub fn lock_fork_source(source: &str) -> Result<ForkSourceLock> {
     validate_vm_name(source, "fork source").map_err(|error| Error::config("fork source", error))?;
     ForkSourceLock::acquire_at(&fork_source_lock_path(source))
+}
+
+/// Serialize pause/resume retries before taking the capture's source lock.
+pub(crate) fn lock_saved_execution(source: &str) -> Result<ForkSourceLock> {
+    validate_vm_name(source, "saved execution")
+        .map_err(|error| Error::config("saved execution", error))?;
+    ForkSourceLock::acquire_at(
+        &fork_source_lock_path(source).with_extension("pause-operation.lock"),
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -365,6 +374,12 @@ pub(crate) fn validate_checkpoint_agent(machine: &str) -> Result<()> {
 /// marker and blocks. Keeping the wait in the VM namespace avoids coupling the
 /// host to container logs, PIDs, or workload-specific files.
 pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
+    // A frozen source cannot answer guest-agent requests. Its retained
+    // checkpoint is validated when preparation reuses it below.
+    let status = control_socket_cmd(&control_socket_path(golden), "STATUS")?;
+    if fork_base_already_paused(&status) {
+        return Ok(());
+    }
     let mut client = branch_client(golden, "wait for forkpoint")?;
     match client
         .branchpoint_wait(timeout)
@@ -434,14 +449,44 @@ fn fork_base_already_paused(status: &str) -> bool {
     status.trim() == "OK paused"
 }
 
+fn policy_allows_snapshot_reuse(
+    source_policy: ForkSourcePolicy,
+    golden_was_paused: bool,
+    reuse_live_snapshot: bool,
+) -> bool {
+    (golden_was_paused || reuse_live_snapshot)
+        && (source_policy != ForkSourcePolicy::Freeze || golden_was_paused)
+}
+
 /// Linux/KVM and macOS/HVF can atomically checkpoint a fork generation and
 /// resume the source on private RAM and disk layers. Other hosts retain the
 /// established frozen fork-base behavior.
+///
+/// aarch64 Linux joined this once libkrun could stream a retained RAM
+/// generation there; the generation copy itself is host-side and carries no
+/// architecture of its own. Without it a branch left the source frozen, which
+/// is a different machine than the one the caller branched — and a frozen
+/// source cannot be exec'd, only stopped or deleted.
+///
 pub fn fork_continue_enabled() -> bool {
-    cfg!(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        target_os = "macos"
-    ))
+    cfg!(any(target_os = "linux", target_os = "macos"))
+}
+
+/// How a branch operation leaves its source machine after the checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ForkSourcePolicy {
+    /// Resume the source where the host supports it.
+    #[default]
+    PlatformDefault,
+    /// Retain the checkpoint and leave the source paused for repeated branches.
+    Freeze,
+}
+
+impl ForkSourcePolicy {
+    /// Whether this policy requests a running source after capture.
+    pub fn continues(self) -> bool {
+        self == Self::PlatformDefault && fork_continue_enabled()
+    }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1485,6 +1530,19 @@ fn set_fork_lineage_memory_limit(
     if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
         return Ok(false);
     }
+    let reply = control_socket_cmd_with_timeout(
+        &control_socket_path(golden),
+        "SAVE_STATUS",
+        std::time::Duration::from_secs(2),
+    )?;
+    let pending = checkpoint_memory_units(&reply)?;
+    // The query must not lend a replacement process the previous VM's budget.
+    if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
+        return Ok(false);
+    }
+    let generations = generations
+        .checked_add(pending)
+        .ok_or_else(|| Error::agent("checkpoint memory accounting", "RAM unit count overflow"))?;
     let budget = fork_lineage_memory_budget(record, generations)?;
     let limit = budget.max_bytes;
     let updated =
@@ -1493,6 +1551,21 @@ fn set_fork_lineage_memory_limit(
         tracing::debug!(%golden, generations, memory_max_bytes = limit, "sized live-branch lineage cgroup");
     }
     Ok(updated)
+}
+
+#[cfg(target_os = "linux")]
+fn checkpoint_memory_units(reply: &str) -> Result<u64> {
+    match reply.trim() {
+        "OK memory_released" => Ok(0),
+        "OK preparing" | "OK ready" | "OK finishing" => Ok(1),
+        // Older runtimes cannot release the source lock during streamed packing.
+        // Their existing serialized capture path still owns the reservation.
+        "ERR EINVAL unknown command" | "ERR EINVAL snapshot dir required" => Ok(0),
+        other => Err(Error::agent(
+            "checkpoint memory accounting",
+            format!("runtime ownership is unknown; refusing to resize memory: {other}"),
+        )),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1524,6 +1597,7 @@ pub(crate) struct ForkLineageMemoryReservation {
     previous_ram_units: u64,
     source_rebased: bool,
     managed: bool,
+    source_released: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -1558,6 +1632,13 @@ impl ForkLineageMemoryReservation {
         Ok(())
     }
 
+    /// The runtime owns the pending-memory record while output runs. Future
+    /// branch/resizing operations include it via SAVE_STATUS. Drop must now
+    /// reconcile the current lineage, not the pre-capture generation count.
+    pub(crate) fn allow_concurrent_branches(&mut self) {
+        self.source_released = true;
+    }
+
     fn reserve(
         golden: &str,
         record: &VmRecord,
@@ -1584,6 +1665,7 @@ impl ForkLineageMemoryReservation {
             previous_ram_units,
             source_rebased: false,
             managed,
+            source_released: false,
         })
     }
 
@@ -1596,6 +1678,32 @@ impl ForkLineageMemoryReservation {
 impl Drop for ForkLineageMemoryReservation {
     fn drop(&mut self) {
         if !self.managed {
+            return;
+        }
+        if self.source_released {
+            let result = (|| -> Result<()> {
+                let _lock = lock_fork_source(&self.golden)?;
+                let db = SmolvmDb::open()?;
+                let Some(record) = db.get_vm(&self.golden)? else {
+                    return Ok(());
+                };
+                if record.pid != self.record.pid
+                    || record.pid_start_time != self.record.pid_start_time
+                {
+                    return Ok(());
+                }
+                let retained = db.retained_fork_snapshot(&self.golden)?;
+                reconcile_fork_lineage_memory_limit(
+                    &db,
+                    &self.golden,
+                    &record,
+                    &vm_data_dir(&self.golden).join("s"),
+                    retained.as_ref(),
+                )
+            })();
+            if let Err(error) = result {
+                tracing::warn!(golden = %self.golden, %error, "retaining checkpoint memory allowance until ownership can be reconciled");
+            }
             return;
         }
         // A published commit marker means the new generation really can retain
@@ -1881,6 +1989,8 @@ pub struct PreparedFork {
     /// caller to log. Empty when the golden has no forwards. When ports were
     /// pinned, `golden_host == clone_host`.
     pub port_remaps: Vec<(u16, u16, u16)>,
+    /// Whether the source resumed after this checkpoint.
+    pub source_continues: bool,
 }
 
 /// A checkpoint that may be reused by a frozen source or an explicit pool
@@ -1931,6 +2041,7 @@ pub struct ForkSpec<'a> {
 /// On any failure after the clone record is inserted, the record and its data
 /// directory are cleaned up before returning the error, so a failed fork leaves
 /// no half-registered clone behind.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_fork(
     db: &SmolvmDb,
     golden: &str,
@@ -1939,6 +2050,7 @@ pub fn prepare_fork(
     clone_forkable: bool,
     fork_env: &[(String, String)],
     fork_secrets: &BTreeMap<String, crate::secrets::SecretRef>,
+    source_policy: ForkSourcePolicy,
 ) -> Result<PreparedFork> {
     let mut prepared = prepare_forks(
         db,
@@ -1951,6 +2063,7 @@ pub fn prepare_fork(
             fork_secrets,
             hold: false,
         }],
+        source_policy,
     )?;
     Ok(prepared.remove(0))
 }
@@ -1964,6 +2077,7 @@ pub fn prepare_held_fork(
     pinned_ports: &[(u16, u16)],
     fork_env: &[(String, String)],
     fork_secrets: &BTreeMap<String, crate::secrets::SecretRef>,
+    source_policy: ForkSourcePolicy,
 ) -> Result<PreparedFork> {
     let mut prepared = prepare_forks(
         db,
@@ -1976,6 +2090,7 @@ pub fn prepare_held_fork(
             fork_secrets,
             hold: true,
         }],
+        source_policy,
     )?;
     Ok(prepared.remove(0))
 }
@@ -1984,7 +2099,7 @@ pub fn prepare_held_fork(
 /// Preparation is transactional: if any clone fails, all clone records and
 /// disks created by this call are removed.
 ///
-/// Linux/x86_64 and macOS resume the source after atomically rotating its
+/// Linux and macOS resume the source after atomically rotating its
 /// writable disks; other hosts retain the source in its paused copy-on-write
 /// state. A later direct fork captures current state; explicit pool
 /// replenishment can reuse its retained generation.
@@ -1992,11 +2107,21 @@ pub fn prepare_forks(
     db: &SmolvmDb,
     golden: &str,
     specs: &[ForkSpec<'_>],
+    source_policy: ForkSourcePolicy,
 ) -> Result<Vec<PreparedFork>> {
     let retained = db
         .retained_fork_snapshot(golden)
         .map_err(|error| Error::agent("read retained fork checkpoint", error.to_string()))?;
-    Ok(prepare_forks_reusing(db, golden, specs, retained.as_ref(), true, false)?.forks)
+    Ok(prepare_forks_reusing(
+        db,
+        golden,
+        specs,
+        retained.as_ref(),
+        true,
+        false,
+        source_policy,
+    )?
+    .forks)
 }
 
 /// Prepare a batch, optionally reusing a proven checkpoint that still belongs
@@ -2009,6 +2134,7 @@ pub(crate) fn prepare_forks_reusing(
     retained: Option<&RetainedForkSnapshot>,
     persist_snapshot: bool,
     reuse_live_snapshot: bool,
+    source_policy: ForkSourcePolicy,
 ) -> Result<PreparedForkBatch> {
     let preparation_started = std::time::Instant::now();
     if specs.is_empty() {
@@ -2047,6 +2173,18 @@ pub(crate) fn prepare_forks_reusing(
             }
         }
     }
+
+    // Reserve every port the engine has already handed out, including the
+    // golden's own. Clone ports are auto-allocated below, and the allocator
+    // only probes whether a port is listening *right now* - which a stopped
+    // machine is not, even though it still owns its port. Without this, a
+    // clone can be given a stopped machine's port and that machine then fails
+    // to bind when it restarts.
+    let recorded = db.list_vms()?;
+    reserve_recorded_host_ports(
+        recorded.iter().map(|(_, record)| record.ports.as_slice()),
+        &mut reserved_ports,
+    );
 
     let golden_rec = db
         .get_vm(golden)?
@@ -2098,7 +2236,7 @@ pub(crate) fn prepare_forks_reusing(
     }
     let golden_was_paused = fork_base_already_paused(&status);
     tracing::info!(%golden, phase = "source_ready", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
-    let fork_continue = fork_continue_enabled();
+    let fork_continue = source_policy.continues();
     let userfaultfd_available = kernel_fault_userfaultfd_available();
     let requested_ram_mode = std::env::var("SMOLVM_BRANCH_RAM_MODE").ok();
     let live_ram_mode = fork_continue
@@ -2119,7 +2257,7 @@ pub(crate) fn prepare_forks_reusing(
         recover_uncommitted_generations(db, golden, &gdir, &snapshot_root)?;
     }
     let reusable = retained.filter(|snapshot| {
-        (golden_was_paused || reuse_live_snapshot)
+        policy_allows_snapshot_reuse(source_policy, golden_was_paused, reuse_live_snapshot)
             && retained_snapshot_is_reusable(
                 &golden_rec,
                 golden_was_paused,
@@ -2613,6 +2751,9 @@ fn prepare_clone_from_snapshot(
         clone_rec.state = crate::config::RecordState::Created;
         clone_rec.pid = None;
         clone_rec.pid_start_time = None;
+        // The clone is a new machine: report when it was created, not when its
+        // source was, so age-based cleanup never mistakes it for an old one.
+        clone_rec.created_at = crate::util::current_timestamp();
         if !spec.fork_env.is_empty() {
             clone_rec
                 .env
@@ -2675,6 +2816,7 @@ fn prepare_clone_from_snapshot(
             snapshot_dir: snapshot_dir.to_path_buf(),
             clone_record: clone_rec,
             port_remaps,
+            source_continues: fork_continue_snapshot(snapshot_dir),
         })
     })();
 
@@ -3555,13 +3697,86 @@ pub fn fail_closed_on_rejuvenation<F: FnOnce()>(
     }
 }
 
-/// Allocate a currently-free host TCP port by binding to port 0 and reading back
-/// the OS-assigned port. Used to give each clone distinct inbound forwards.
+/// Lowest port handed out to a clone. Linux allocates ephemeral ports from
+/// 32768 upward, so staying below that keeps the kernel from handing the same
+/// number to an unrelated outbound connection.
+const CLONE_PORT_FLOOR: u16 = 20_000;
+/// One past the highest port handed out to a clone.
+const CLONE_PORT_CEILING: u16 = 32_000;
+
+/// Allocate a host TCP port for a clone's inbound forward.
+///
+/// Binding port 0 and reading the assignment back is the obvious way to do
+/// this and the wrong one: that yields an *ephemeral* port, and dropping the
+/// listener returns the number to the kernel's pool. Anything the host dials
+/// between here and the clone's own bind — an image pull, most reliably — can
+/// be given that exact port, and the clone then fails to start with "Address
+/// already in use". Allocating below the ephemeral range instead means only
+/// another deliberate bind can collide, which the free check below catches.
 fn alloc_free_host_port() -> Option<u16> {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|addr| addr.port())
+    let span = u32::from(CLONE_PORT_CEILING - CLONE_PORT_FLOOR);
+    for _ in 0..256 {
+        let offset = host_random_u16()? % span as u16;
+        let port = CLONE_PORT_FLOOR + offset;
+        // Binding confirms the port is free; dropping it immediately is safe
+        // here because nothing else will be *assigned* this number.
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return Some(port);
+        }
+    }
+    None
+}
+
+/// Two random bytes from the host RNG, for choosing a clone's host port.
+fn host_random_u16() -> Option<u16> {
+    use std::io::Read;
+    let mut bytes = [0u8; 2];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .ok()?;
+    Some(u16::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod clone_port_tests {
+    use super::*;
+
+    #[test]
+    fn a_clone_port_never_comes_from_the_ephemeral_range() {
+        // The kernel allocates ephemeral ports from 32768 up. A clone port
+        // drawn from there is handed back on close and can be taken by any
+        // outbound connection before the clone binds it.
+        for _ in 0..64 {
+            let port = alloc_free_host_port().expect("a free port");
+            assert!(
+                (CLONE_PORT_FLOOR..CLONE_PORT_CEILING).contains(&port),
+                "{port} is outside the reserved range"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_clones_are_given_distinct_ports() {
+        let mut reserved = HashSet::new();
+        let ports: Vec<u16> = (0..8)
+            .map(|_| alloc_free_host_port_excluding(&mut reserved).expect("a free port"))
+            .collect();
+        let unique: HashSet<u16> = ports.iter().copied().collect();
+        assert_eq!(unique.len(), ports.len(), "ports repeated: {ports:?}");
+    }
+}
+
+/// Add every recorded host port to `reserved`, whatever state its machine is
+/// in, so the auto-allocator never hands out a port another machine owns.
+fn reserve_recorded_host_ports<'a>(
+    recorded: impl Iterator<Item = &'a [(u16, u16)]>,
+    reserved: &mut HashSet<u16>,
+) {
+    for ports in recorded {
+        for (host, _guest) in ports {
+            reserved.insert(*host);
+        }
+    }
 }
 
 fn alloc_free_host_port_excluding(reserved: &mut HashSet<u16>) -> Option<u16> {
@@ -3596,6 +3811,29 @@ fn host_random_hex(hex_len: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stopped_machines_port_is_still_reserved_against_clones() {
+        // The allocator's bind probe cannot see a stopped machine's port, so
+        // the reservation has to come from the record, not from the kernel.
+        let running: [(u16, u16); 1] = [(23_996, 80)];
+        let stopped: [(u16, u16); 1] = [(24_100, 8080)];
+        let mut reserved = HashSet::new();
+        reserve_recorded_host_ports(
+            [running.as_slice(), stopped.as_slice()].into_iter(),
+            &mut reserved,
+        );
+        assert!(reserved.contains(&23_996));
+        assert!(reserved.contains(&24_100));
+
+        for _ in 0..64 {
+            let Some(port) = alloc_free_host_port_excluding(&mut reserved) else {
+                break;
+            };
+            assert_ne!(port, 23_996);
+            assert_ne!(port, 24_100);
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -4258,6 +4496,33 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn checkpoint_memory_ownership_is_counted_and_unknown_status_fails_closed() {
+        for state in ["preparing", "ready", "finishing"] {
+            assert_eq!(
+                checkpoint_memory_units(&format!("OK {state}\n")).unwrap(),
+                1
+            );
+        }
+        for reply in [
+            "OK memory_released\n",
+            "ERR EINVAL unknown command\n",
+            "ERR EINVAL snapshot dir required\n",
+        ] {
+            assert_eq!(checkpoint_memory_units(reply).unwrap(), 0);
+        }
+        for reply in [
+            "",
+            "OK",
+            "OK durable",
+            "ERR EIO disconnected",
+            "OK finishing\nOK memory_released",
+        ] {
+            assert!(checkpoint_memory_units(reply).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn lineage_reclaim_threshold_tracks_growth_and_collection() {
         let record = VmRecord::new("golden".into(), 2, 1024, vec![], vec![], false);
         let base = fork_lineage_memory_budget(&record, 0).unwrap();
@@ -4720,5 +4985,33 @@ mod tests {
             !torn_down.get(),
             "a successful rejuvenation must not tear the clone down"
         );
+    }
+
+    #[test]
+    fn freeze_source_disables_source_resume() {
+        assert!(!ForkSourcePolicy::Freeze.continues());
+        assert_eq!(
+            ForkSourcePolicy::PlatformDefault.continues(),
+            fork_continue_enabled()
+        );
+    }
+
+    #[test]
+    fn freeze_source_captures_again_before_reusing_a_live_checkpoint() {
+        assert!(!policy_allows_snapshot_reuse(
+            ForkSourcePolicy::Freeze,
+            false,
+            true
+        ));
+        assert!(policy_allows_snapshot_reuse(
+            ForkSourcePolicy::Freeze,
+            true,
+            true
+        ));
+        assert!(policy_allows_snapshot_reuse(
+            ForkSourcePolicy::PlatformDefault,
+            false,
+            true
+        ));
     }
 }

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/smolvm-checkpoint",
     "crates/smolvm-agent",
     "crates/smolvm-cuda",
     "crates/smolvm-cuda-guest",
@@ -9,6 +10,7 @@ members = [
     "crates/smolvm-cudart-shim",
     "crates/smolvm-nvml-shim",
     "crates/smolvm-network",
+    "crates/smolvm-credentials",
     "crates/smolvm-oci-layer",
     "crates/smolvm-pack",
     "crates/smolvm-protocol",
@@ -21,7 +23,7 @@ resolver = "2"
 
 [package]
 name = "smolvm"
-version = "1.16.1"
+version = "1.19.0"
 edition = "2021"
 description = "OCI-native microVM runtime"
 license = "Apache-2.0"
@@ -38,14 +40,16 @@ name = "smolvm"
 path = "src/main.rs"
 
 [dependencies]
-smolvm-network = { path = "crates/smolvm-network", version = "1.16.1" }
-smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.16.1" }
-smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.16.1" }
-smolvm-pack = { path = "crates/smolvm-pack", version = "1.16.1" }
-smolvm-registry = { path = "crates/smolvm-registry", version = "1.16.1" }
-smolfile = { path = "crates/smolvm-smolfile", version = "1.16.1" }
+smolvm-credentials = { path = "crates/smolvm-credentials", version = "1.19.0" }
+smolvm-checkpoint = { path = "crates/smolvm-checkpoint", version = "1.19.0" }
+smolvm-network = { path = "crates/smolvm-network", version = "1.19.0" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.19.0" }
+smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.19.0" }
+smolvm-pack = { path = "crates/smolvm-pack", version = "1.19.0" }
+smolvm-registry = { path = "crates/smolvm-registry", version = "1.19.0" }
+smolfile = { path = "crates/smolvm-smolfile", version = "1.19.0" }
 thiserror = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -134,7 +138,7 @@ windows-sys = { version = "0.60", features = [
 
 [dev-dependencies]
 tempfile = "3"
-smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.16.1" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.19.0" }
 regex = "1"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"

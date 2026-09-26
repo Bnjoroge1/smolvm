@@ -10,13 +10,15 @@ use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use crate::network::backend::COMPAT_NET_FEATURES;
 use crate::network::backend::TSI_FEATURE_HIJACK_INET;
-use crate::network::{plan_launch_network, EffectiveNetworkBackend};
+use crate::network::EffectiveNetworkBackend;
 use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::{libkrun_filename, libkrunfw_filename};
 
 use crate::agent::vsock_service;
 use smolvm_network::PortMapping as VirtioPortMapping;
-use smolvm_network::{start_virtio_network, GuestNetworkConfig, VirtioNetworkRuntime};
+use smolvm_network::{
+    start_virtio_network, BoundPublishedPorts, GuestNetworkConfig, VirtioNetworkRuntime,
+};
 use smolvm_protocol::{guest_env, ports};
 use socket2::Socket;
 #[cfg(windows)]
@@ -251,6 +253,8 @@ pub fn create_disk_overlays(specs: &[DiskOverlaySpec]) -> Result<()> {
 /// on manager/launcher functions.
 #[derive(Debug, Clone, Default)]
 pub struct LaunchFeatures {
+    /// Explicitly restore a paused machine; never permit a silent cold boot.
+    pub resume_paused: bool,
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<std::path::PathBuf>,
     /// Enable CUDA-over-vsock: smolvm starts a host CUDA server and the guest
@@ -263,6 +267,11 @@ pub struct LaunchFeatures {
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// Credential policy to enforce: mounts the machine CA and runs the
+    /// interceptor beside the network stack for the VM's lifetime.
+    pub credentials: Option<crate::credentials::CredentialLaunch>,
+    /// Trusted host service for this launch; never persisted in a machine record.
+    pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
     /// The launcher assigns each a vsock port, wires libkrun, and tells the guest
     /// agent to start the matching relay.
@@ -577,6 +586,12 @@ pub struct LaunchConfig<'a> {
     /// while privileged. When present, the virtio-net arm bridges the guest NIC to
     /// the tap instead of running the NAT gateway. `None` for non-pod VMs.
     pub pod_net: Option<crate::agent::pod_net::PodNetLaunch>,
+    /// Credential policy for this machine, when it has one. The launcher mounts
+    /// the machine CA read-only at the guest credentials directory and, on
+    /// virtio-net, starts the interceptor that HTTPS flows are redirected to.
+    pub credentials: Option<&'a crate::credentials::CredentialLaunch>,
+    /// Launch-scoped host service for all outbound TCP streams.
+    pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
 }
 
 /// Launch the agent VM using libkrun.
@@ -618,6 +633,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         egress_refresh_hosts,
         egress_telemetry,
         pod_net,
+        credentials,
+        external_interceptor,
     } = config;
     // `pod_net` drives the Linux-only pod netns-tap datapath; on other targets the
     // field exists (cross-platform LaunchConfig) but is never read.
@@ -625,6 +642,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     let _ = &pod_net;
 
     crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
+    if let Some(endpoint) = external_interceptor {
+        validate_external_interceptor(
+            endpoint,
+            resources,
+            credentials.is_some(),
+            pod_net.is_some(),
+        )?;
+    }
 
     // CUDA machines get an implicit dax RING mount: a per-machine host dir the
     // guest shim and the CUDA daemon both mmap for the file-backed clone-ring
@@ -699,6 +724,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
             }
         }
+    }
+    // Only the public CA is exposed; the signing key stays in the parent dir.
+    if let Some(credentials) = credentials {
+        credentials.ensure_ca()?;
+        mounts_vec.push(credentials.guest_ca_mount());
     }
     let mounts: &[crate::data::storage::HostMount] = &mounts_vec;
 
@@ -1031,7 +1061,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());
+        let network_plan = select_network_plan(
+            resources,
+            *dns_filter_enabled,
+            port_mappings.len(),
+            credentials.is_some() || external_interceptor.is_some(),
+        );
+        // Lives until the VM exits: dropping it would stop substitution.
+        let mut _credential_interceptor: Option<smolvm_credentials::Interceptor> = None;
 
         // `mut` is only needed on unix (the VirtioNet arm assigns it); on
         // Windows the runtime is owned by the accept thread, so the launcher's
@@ -1159,6 +1196,41 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     }
                 }
 
+                // TSI terminates guest connects inside libkrun, so redirecting
+                // HTTPS flows to the interceptor needs the fork's hook; without
+                // it a credential policy cannot be enforced on this backend.
+                if let Some(credentials) = credentials {
+                    let Some(set_intercept) = krun.set_stream_intercept else {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure credentials",
+                            "this libkrun cannot redirect TSI flows (krun_set_stream_intercept not found); \
+                             use the default virtio-net backend or update libkrun",
+                        ));
+                    };
+                    let interceptor = credentials.start_interceptor().inspect_err(|_| {
+                        krun_free_ctx(ctx);
+                    })?;
+                    let endpoint = interceptor.endpoint();
+                    let addr = CString::new(endpoint.addr.to_string()).expect("socket address");
+                    let token: String = endpoint.token.iter().map(|b| format!("{b:02x}")).collect();
+                    let token = CString::new(token).expect("hex token");
+                    if set_intercept(
+                        ctx,
+                        addr.as_ptr(),
+                        token.as_ptr(),
+                        smolvm_network::tcp_relay::INTERCEPTED_PORT,
+                    ) < 0
+                    {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure credentials",
+                            "krun_set_stream_intercept failed",
+                        ));
+                    }
+                    _credential_interceptor = Some(interceptor);
+                }
+
                 tracing::info!("network backend: tsi");
                 None
             }
@@ -1179,11 +1251,31 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     return Err(Error::agent("configure vsock", "krun_add_vsock failed"));
                 }
 
-                let mut guest_network = GuestNetworkConfig::default();
+                let mut guest_network = crate::network::launch::apply_guest_subnet(
+                    GuestNetworkConfig::default(),
+                    resources,
+                )
+                .inspect_err(|_| krun_free_ctx(ctx))?;
                 guest_network.host_service = crate::network::launch::guest_host_service()
                     .map_err(|reason| Error::config("configure guest rollout ingress", reason))?;
+                // The interceptor runs in this process beside the network stack;
+                // the relay dials it for every guest HTTPS flow the egress policy
+                // admits, so the guest cannot route around substitution.
+                if let Some(credentials) = credentials {
+                    let interceptor = credentials.start_interceptor().inspect_err(|_| {
+                        krun_free_ctx(ctx);
+                    })?;
+                    guest_network.intercept = Some(smolvm_network::StreamInterception::Https(
+                        interceptor.endpoint(),
+                    ));
+                    _credential_interceptor = Some(interceptor);
+                }
+                if let Some(endpoint) = external_interceptor {
+                    guest_network.intercept =
+                        Some(smolvm_network::StreamInterception::AllTcp(*endpoint));
+                }
                 // A custom resolver (--dns) becomes the gateway's upstream: the
-                // guest still points at the gateway (100.96.0.1), which forwards
+                // guest still points at the gateway (100.96.0.1 by default), which forwards
                 // queries to this address instead of the default.
                 if let Some(dns) = resources.dns {
                     guest_network.upstream_dns = dns;
@@ -1308,13 +1400,16 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                             // SAFETY: ownership of the host-side socketpair fd transfers
                             // here (already inside the function's outer `unsafe` block).
                             let host_stream = Socket::from_raw_fd(host_fd);
-                            let runtime = match start_virtio_network(
-                                host_stream,
-                                guest_network,
-                                &virtio_port_mappings,
-                                egress,
-                                fabric_lease,
-                            ) {
+                            let runtime = match BoundPublishedPorts::bind(&virtio_port_mappings)
+                                .and_then(|ports| {
+                                    start_virtio_network(
+                                        host_stream,
+                                        guest_network,
+                                        ports,
+                                        egress,
+                                        fabric_lease,
+                                    )
+                                }) {
                                 Ok(runtime) => runtime,
                                 Err(err) => {
                                     libc::close(guest_fd);
@@ -1356,6 +1451,17 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
                 #[cfg(windows)]
                 {
+                    // The runtime starts on the accept thread below, once the VM is
+                    // already booting, so bind published ports now: a port in use
+                    // must fail the launch, not leave the guest without a network.
+                    let published_ports = BoundPublishedPorts::bind(&virtio_port_mappings)
+                        .map_err(|e| {
+                            krun_free_ctx(ctx);
+                            Error::agent(
+                                "configure virtio-net",
+                                format!("failed to start virtio network runtime: {e}"),
+                            )
+                        })?;
                     // Per-VM AF_UNIX path for the net channel, a sibling of the
                     // agent-control vsock socket (already a working AF_UNIX path).
                     let net_sock_path = vsock_socket.with_extension("net");
@@ -1397,7 +1503,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                             Ok((sock, _)) => match start_virtio_network(
                                 sock,
                                 guest_network,
-                                &virtio_port_mappings,
+                                published_ports,
                                 egress,
                                 fabric_lease,
                             ) {
@@ -1506,18 +1612,28 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "add extra disk",
                 "path contains null byte"
             );
-            if krun_add_disk2(
-                ctx,
-                block_id.as_ptr(),
-                path.as_ptr(),
-                format.to_krun_u32(),
-                *read_only,
-            ) < 0
-            {
+            // Through the same helper the managed disks use, so `--block-io`
+            // reaches these too. Attaching them with a bare `krun_add_disk2`
+            // pinned them to the synchronous engine, which silently excluded
+            // the io_uring path from the one disk it exists for: a raw device
+            // a caller attached for a database.
+            let result = add_block_disk(
+                BlockDisk {
+                    ctx,
+                    block_id: block_id.as_ptr(),
+                    disk_path: path.as_ptr(),
+                    disk_format: format.to_krun_u32(),
+                    read_only: *read_only,
+                },
+                resources.block_io,
+                krun_add_disk2,
+                krun_add_disk4,
+            );
+            if result < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
                     "add extra disk",
-                    format!("krun_add_disk2 failed for extra disk {}", i),
+                    block_io_error(&format!("extra disk {i}"), resources.block_io, result),
                 ));
             }
             tracing::debug!(disk = i, path = %disk_path.display(), read_only, "added extra disk");
@@ -2314,14 +2430,49 @@ pub(crate) fn bind_unix_listener(path: &Path) -> std::io::Result<Socket> {
     Ok(listener)
 }
 
+/// Validate a host interceptor and reject network modes that could bypass it.
+pub fn validate_external_interceptor(
+    endpoint: &smolvm_protocol::InterceptEndpoint,
+    resources: &crate::agent::VmResources,
+    has_credentials: bool,
+    has_pod_network: bool,
+) -> Result<()> {
+    let reason = if !endpoint.addr.ip().is_loopback()
+        || endpoint.addr.port() == 0
+        || endpoint.token == [0; 32]
+    {
+        Some(
+            "interceptor requires a loopback address, nonzero port and random authentication token",
+        )
+    } else if resources.network_backend == Some(crate::network::NetworkBackend::Tsi) {
+        Some("external interception requires virtio-net")
+    } else if resources.network_name.is_some() || has_pod_network {
+        Some("external interception cannot use named or pod networks")
+    } else if has_credentials {
+        Some("external interception cannot be combined with built-in credential bindings")
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => Err(Error::config("egress interceptor", reason)),
+        None => Ok(()),
+    }
+}
+
 fn select_network_plan(
     resources: &VmResources,
     dns_filter_enabled: bool,
     port_count: usize,
+    has_credentials: bool,
 ) -> crate::network::LaunchNetworkPlan {
     let dns_filter_placeholder = [String::from("configured")];
     let dns_filter_hosts = dns_filter_enabled.then_some(dns_filter_placeholder.as_slice());
-    plan_launch_network(resources, dns_filter_hosts, port_count)
+    crate::network::plan_launch_network_with(
+        resources,
+        dns_filter_hosts,
+        port_count,
+        has_credentials,
+    )
 }
 
 /// Resolve a hostname to /32 CIDR strings for the egress-refresh thread.
@@ -2652,6 +2803,64 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn external_interceptor_requires_an_exclusive_host_binding() {
+        let endpoint = smolvm_protocol::InterceptEndpoint {
+            addr: "127.0.0.1:1234".parse().unwrap(),
+            token: [1; 32],
+        };
+        let resources = VmResources::default();
+        assert!(validate_external_interceptor(&endpoint, &resources, false, false).is_ok());
+        assert_eq!(
+            select_network_plan(&resources, false, 0, true).backend,
+            crate::network::EffectiveNetworkBackend::VirtioNet
+        );
+        for addr in ["0.0.0.0:1234", "192.0.2.1:1234", "127.0.0.1:0"] {
+            assert!(validate_external_interceptor(
+                &smolvm_protocol::InterceptEndpoint {
+                    addr: addr.parse().unwrap(),
+                    ..endpoint
+                },
+                &resources,
+                false,
+                false,
+            )
+            .is_err());
+        }
+        assert!(validate_external_interceptor(
+            &smolvm_protocol::InterceptEndpoint {
+                token: [0; 32],
+                ..endpoint
+            },
+            &resources,
+            false,
+            false,
+        )
+        .is_err());
+        assert!(validate_external_interceptor(&endpoint, &resources, true, false).is_err());
+        assert!(validate_external_interceptor(&endpoint, &resources, false, true).is_err());
+        assert!(validate_external_interceptor(
+            &endpoint,
+            &VmResources {
+                network_backend: Some(crate::network::NetworkBackend::Tsi),
+                ..resources.clone()
+            },
+            false,
+            false
+        )
+        .is_err());
+        assert!(validate_external_interceptor(
+            &endpoint,
+            &VmResources {
+                network_name: Some("shared".into()),
+                ..resources
+            },
+            false,
+            false
+        )
+        .is_err());
+    }
 
     #[test]
     fn async_block_errors_distinguish_old_library_from_host_support() {

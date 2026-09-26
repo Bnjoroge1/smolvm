@@ -138,6 +138,10 @@ impl Supervisor {
         // Machine is dead — try to retrieve its exit code via waitpid
         // and persist it so the restart policy can use it.
         if let Ok(Some(record)) = self.state.db().get_vm(name) {
+            if record.paused_checkpoint.is_some() {
+                self.next_restart_at.remove(name);
+                return Ok(());
+            }
             // A recovered manager can lack a child handle and its PID file
             // can be missing while the database still identifies a live VMM.
             // Do not erase that identity or schedule another launch.
@@ -311,6 +315,7 @@ impl Supervisor {
         let cuda_fork_pool_size = record.cuda_fork_pool_size;
         let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
         let forkable = record.forkable_on_start();
+        let external_interceptor_required = record.external_interceptor_required;
         let name_for_features = name.to_string();
 
         let entry_clone = entry.clone();
@@ -321,10 +326,14 @@ impl Supervisor {
                 Some(&name_for_features),
                 source_smolmachine.as_deref(),
                 dns_filter_hosts,
+                entry.credentials.clone(),
             )?;
             features.cuda_fork_pool_size = cuda_fork_pool_size;
             features.cuda_vram_limit_mib = cuda_vram_limit_mib;
             features.forkable = forkable;
+            if external_interceptor_required {
+                features.external_interceptor = entry.external_interceptor;
+            }
             entry
                 .manager
                 .ensure_running_via_subprocess(mounts, ports, resources, features)

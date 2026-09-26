@@ -6,11 +6,15 @@
 //!
 //! The static FFI path in `launcher.rs` remains untouched for normal operations.
 
+use crate::agent::vsock_service;
 use crate::network::backend::COMPAT_NET_FEATURES;
 use crate::network::backend::TSI_FEATURE_HIJACK_INET;
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
+
 use smolvm_network::PortMapping as VirtioPortMapping;
-use smolvm_network::{start_virtio_network, GuestNetworkConfig, VirtioNetworkRuntime};
+use smolvm_network::{
+    start_virtio_network, BoundPublishedPorts, GuestNetworkConfig, VirtioNetworkRuntime,
+};
 use smolvm_protocol::{guest_env, ports};
 #[cfg(unix)]
 use socket2::Socket;
@@ -74,6 +78,10 @@ pub struct PackedLaunchConfig<'a> {
     /// `cuda_host` server loaded the real driver. Mirrors the non-packed
     /// launcher's `cuda_socket`.
     pub cuda_socket: Option<&'a Path>,
+    /// Host SSH-agent socket bridged into the guest via the SSH-agent vsock
+    /// service. The guest agent activates its side through `SMOLVM_SSH_AGENT`.
+    pub ssh_agent_socket: Option<&'a Path>,
+
     /// Hostnames the egress policy permits resolving and connecting to
     /// (`--allow-host`), mirroring the main launcher's `egress_refresh_hosts`.
     /// Owned because the launch runs in a forked child that outlives the
@@ -485,7 +493,13 @@ pub fn launch_agent_vm_dynamic(
                 free_ctx_on_err!("krun_add_vsock failed");
             }
 
-            let mut guest_network = GuestNetworkConfig::default();
+            let mut guest_network = match crate::network::launch::apply_guest_subnet(
+                GuestNetworkConfig::default(),
+                &config.resources,
+            ) {
+                Ok(guest_network) => guest_network,
+                Err(error) => free_ctx_on_err!(error),
+            };
             guest_network.host_service = crate::network::launch::guest_host_service()?;
             let mut guest_mac = guest_network.guest_mac;
             let port_mappings: Vec<VirtioPortMapping> = config
@@ -511,13 +525,9 @@ pub fn launch_agent_vm_dynamic(
                     create_unix_stream_pair().map_err(|e| format!("socketpair failed: {e}"))?;
                 // SAFETY: ownership of the host-side socketpair fd transfers here.
                 let host_stream = unsafe { Socket::from_raw_fd(host_fd) };
-                let runtime = match start_virtio_network(
-                    host_stream,
-                    guest_network,
-                    &port_mappings,
-                    egress,
-                    None,
-                ) {
+                let runtime = match BoundPublishedPorts::bind(&port_mappings).and_then(|ports| {
+                    start_virtio_network(host_stream, guest_network, ports, egress, None)
+                }) {
                     Ok(runtime) => runtime,
                     Err(err) => {
                         // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
@@ -546,6 +556,13 @@ pub fn launch_agent_vm_dynamic(
             }
             #[cfg(windows)]
             {
+                // Bind before boot; see the static launcher.
+                let published_ports = match BoundPublishedPorts::bind(&port_mappings) {
+                    Ok(ports) => ports,
+                    Err(e) => {
+                        free_ctx_on_err!(format!("failed to start virtio network runtime: {e}"))
+                    }
+                };
                 let net_sock_path = config.vsock_socket.with_extension("net");
                 let listener = match super::launcher::bind_unix_listener(&net_sock_path) {
                     Ok(listener) => listener,
@@ -576,7 +593,7 @@ pub fn launch_agent_vm_dynamic(
                     .name("smolvm-net-accept".into())
                     .spawn(move || match listener.accept() {
                         Ok((sock, _)) => {
-                            match start_virtio_network(sock, guest_network, &port_mappings, egress, None) {
+                            match start_virtio_network(sock, guest_network, published_ports, egress, None) {
                                 Ok(runtime) => runtime.block_until_shutdown(),
                                 Err(err) => {
                                     tracing::error!(error = %err, "virtio-net runtime failed to start")
@@ -647,6 +664,47 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
+    // Attached host disks (`--disk`), after storage and overlay, so they land on
+    // /dev/vdc onward in the order the machine recorded. The static launcher has
+    // carried these for the from-vm export helper; the dynamic path dropped them,
+    // which silently gave a packed machine fewer disks than it asked for.
+    for (i, disk) in config.resources.disks.iter().enumerate() {
+        let attached_id = try_or_free_ctx!(
+            CString::new(format!("attached{i}")),
+            "attached disk id contains null byte"
+        );
+        let attached_path =
+            try_or_free_ctx!(path_to_cstring(&disk.path), "disk path contains null byte");
+        let format = crate::data::disk::detect_disk_format(&disk.path).to_krun_u32();
+        let result = if disk.read_only {
+            unsafe {
+                (krun.add_disk2)(
+                    ctx,
+                    attached_id.as_ptr(),
+                    attached_path.as_ptr(),
+                    format,
+                    true,
+                )
+            }
+        } else {
+            add_dynamic_block_disk(
+                krun,
+                ctx,
+                attached_id.as_ptr(),
+                attached_path.as_ptr(),
+                format,
+                config.resources.block_io,
+            )
+        };
+        if result < 0 {
+            free_ctx_on_err!(dynamic_block_error(
+                &format!("attached disk {} ({})", i, disk.path.display()),
+                config.resources.block_io,
+                result
+            ));
+        }
+    }
+
     // Add vsock port for control channel
     let socket_path = try_or_free_ctx!(
         path_to_cstring(config.vsock_socket),
@@ -658,22 +716,36 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_add_vsock_port2 failed");
     }
 
-    // Bridge the guest CUDA client (vsock port `ports::CUDA`) to the host CUDA
-    // server socket. `listen=false`: the guest connects out and libkrun forwards
-    // to the AF_UNIX path where `cuda_host::start` is serving. Mirrors the
-    // non-packed launcher; keeps this launcher policy-free (the caller owns the
-    // server lifecycle).
-    if let Some(cuda_sock) = config.cuda_socket {
-        let cuda_sock_c = try_or_free_ctx!(
-            path_to_cstring(cuda_sock),
-            "cuda socket path contains null byte"
+    // Guest↔host vsock services. The registry owns both sides of each bridge:
+    // the host port registration below and the guest activation env injected
+    // while building the init environment.
+    let vsock_inputs = vsock_service::VsockServiceInputs {
+        ssh_agent_socket: config.ssh_agent_socket,
+        dns_filter_socket: None,
+        cuda_socket: config.cuda_socket,
+        docker_socket: None,
+    };
+    let active_vsock: Vec<_> = vsock_service::registry()
+        .iter()
+        .filter_map(|svc| svc.resolve(&vsock_inputs))
+        .collect();
+    for svc in &active_vsock {
+        debug_assert_ne!(
+            svc.port,
+            ports::AGENT_CONTROL,
+            "{} would shadow the agent control channel",
+            svc.name
         );
-        // SAFETY: ctx is valid, cuda_sock_c is a valid C string.
-        if unsafe { (krun.add_vsock_port2)(ctx, ports::CUDA, cuda_sock_c.as_ptr(), false) } < 0 {
-            free_ctx_on_err!("krun_add_vsock_port2 (CUDA) failed");
+        let service_socket = try_or_free_ctx!(
+            path_to_cstring(svc.socket),
+            "vsock service socket path contains null byte"
+        );
+        if unsafe { (krun.add_vsock_port2)(ctx, svc.port, service_socket.as_ptr(), svc.listen) } < 0
+        {
+            free_ctx_on_err!(format!("krun_add_vsock_port2 ({}) failed", svc.name));
         }
         if config.debug {
-            eprintln!("debug: CUDA-over-vsock bridged to {}", cuda_sock.display());
+            eprintln!("debug: {} bridged to {}", svc.name, svc.socket.display());
         }
     }
 
@@ -745,14 +817,11 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
-    // The packed launcher wires CUDA directly instead of going through the
-    // shared vsock-service builder, so it must carry the same guest feature
-    // sentinel explicitly. Without it the agent never stages the bundled
-    // shims and `pack run --cuda` boots a CUDA bridge that workloads cannot use.
-    if config.cuda_socket.is_some() {
-        let cuda_env = format!("{}={}", guest_env::CUDA_ZEROCOPY, guest_env::VALUE_ON);
-        if let Ok(cstr) = CString::new(cuda_env) {
-            env_strings.push(cstr);
+    // Activate the guest side of each enabled vsock service. These env vars
+    // come from the same registry that wired the host ports above.
+    for svc in &active_vsock {
+        for (key, value) in svc.guest_env {
+            env_strings.push(cstr(&format!("{key}={value}")));
         }
     }
 

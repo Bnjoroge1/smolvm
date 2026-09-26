@@ -820,6 +820,37 @@ pub struct AgentManager {
     inner: Arc<Mutex<AgentInner>>,
 }
 
+/// Apply the persistent fail-closed policy before spawning a named VM. Every
+/// launch path funnels through `start_via_subprocess`, including API restarts.
+fn reject_missing_external_interceptor(
+    record: &crate::config::VmRecord,
+    endpoint: Option<&smolvm_protocol::InterceptEndpoint>,
+) -> Result<()> {
+    if record.external_interceptor_required && endpoint.is_none() {
+        return Err(Error::config(
+            "egress interceptor",
+            "this machine requires an external interceptor on every start; pass --egress-interceptor and set SMOLVM_INTERCEPTOR_TOKEN",
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_external_interceptor_requirement(
+    db: &crate::db::SmolvmDb,
+    name: &str,
+    endpoint: Option<&smolvm_protocol::InterceptEndpoint>,
+) -> Result<()> {
+    if let Some(record) = db.get_vm(name)? {
+        reject_missing_external_interceptor(&record, endpoint)?;
+        if endpoint.is_some() && !record.external_interceptor_required {
+            // Persist before spawning the VMM. If the caller or boot fails,
+            // every later start still requires interception.
+            db.update_vm(name, |record| record.external_interceptor_required = true)?;
+        }
+    }
+    Ok(())
+}
+
 impl AgentManager {
     /// Create a new agent manager with explicit paths (low-level).
     ///
@@ -1603,6 +1634,24 @@ impl AgentManager {
         resources: VmResources,
         mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
+        if let Some(name) = self.name() {
+            if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+                if record.paused_checkpoint.is_some() && !features.resume_paused {
+                    return Err(Error::agent_conflict(
+                        "start machine",
+                        "machine is paused; use resume to preserve its execution state",
+                    ));
+                }
+                if features.resume_paused
+                    && crate::portable_checkpoint::pending_dir(&vm_data_dir(name)).is_none()
+                {
+                    return Err(Error::agent_conflict(
+                        "resume machine",
+                        "no prepared checkpoint; refusing a fresh boot",
+                    ));
+                }
+            }
+        }
         // Check if agent is already running with the same configuration.
         // try_connect_existing restores config from disk on reconnect,
         // so the comparison below is accurate even for detached VMs.
@@ -1641,6 +1690,14 @@ impl AgentManager {
         };
 
         if needs_restart {
+            if let Some(name) = self.name() {
+                if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+                    reject_missing_external_interceptor(
+                        &record,
+                        features.external_interceptor.as_ref(),
+                    )?;
+                }
+            }
             tracing::info!("restarting agent VM due to configuration change");
             self.stop()?;
         } else {
@@ -2066,6 +2123,28 @@ impl AgentManager {
             }
         }
 
+        if let Some(endpoint) = &features.external_interceptor {
+            launcher::validate_external_interceptor(
+                endpoint,
+                &resources,
+                features.credentials.is_some(),
+                features.pod_netns.is_some(),
+            )?;
+            if features.snapshot_dir.is_some() || features.forkable {
+                return Err(Error::config(
+                    "egress interceptor",
+                    "external interception does not support checkpoint or branch launches",
+                ));
+            }
+        }
+        if let Some(name) = self.name() {
+            let db = crate::db::SmolvmDb::open()?;
+            enforce_external_interceptor_requirement(
+                &db,
+                name,
+                features.external_interceptor.as_ref(),
+            )?;
+        }
         if let Some(snapshot) = features.snapshot_dir.as_deref() {
             crate::portable_checkpoint::prepare_memory_backend(snapshot, features.forkable)?;
         }
@@ -2384,6 +2463,14 @@ impl AgentManager {
             None
         };
 
+        // Supplied credential values ride in the boot process's own
+        // environment, never in the boot config written below.
+        let credential_env = features
+            .credentials
+            .as_mut()
+            .map(|launch| launch.child_env())
+            .unwrap_or_default();
+
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
             rootfs_path: self.rootfs_path.clone(),
@@ -2404,10 +2491,24 @@ impl AgentManager {
             expose_docker: features.expose_docker,
             published_sockets: features.published_sockets,
             dns_filter_hosts: features.dns_filter_hosts,
+            credentials: features.credentials,
+            external_interceptor: features.external_interceptor,
             packed_layers_dir: features.packed_layers_dir,
             pack_idmap_source,
             extra_disks: {
                 let mut __d = features.extra_disks;
+                // `--disk` values recorded on the machine, re-attached on every
+                // start in the order given. Format is read from the file's magic
+                // rather than assumed: a block device and a raw image are both
+                // `Raw`, but an attached qcow2 must be declared qcow2 or libkrun
+                // exposes its header as the whole device.
+                for disk in &resources_for_config.disks {
+                    __d.push((
+                        disk.path.clone(),
+                        disk.read_only,
+                        crate::data::disk::detect_disk_format(&disk.path),
+                    ));
+                }
                 if let Ok(spec) = std::env::var("SMOLVM_EXTRA_DISK") {
                     for entry in spec.split(',').filter(|s| !s.is_empty()) {
                         let (path, ro) = match entry.strip_suffix(":ro") {
@@ -2433,8 +2534,13 @@ impl AgentManager {
             .join("boot-config.json");
         let config_json = serde_json::to_vec(&config)
             .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
-        std::fs::write(&config_path, &config_json)
+        let mut config_file = tempfile::NamedTempFile::new_in(config_path.parent().unwrap())
+            .map_err(|e| Error::agent("create boot config", e.to_string()))?;
+        std::io::Write::write_all(&mut config_file, &config_json)
             .map_err(|e| Error::agent("write boot config", e.to_string()))?;
+        config_file
+            .persist(&config_path)
+            .map_err(|e| Error::agent("persist boot config", e.to_string()))?;
         tracing::info!(
             elapsed_ms = t_launch.elapsed().as_millis(),
             "boot: config written"
@@ -2509,7 +2615,14 @@ impl AgentManager {
                 }
             }
         }
+        for (var, value) in &credential_env {
+            match value {
+                Some(value) => cmd.env(var, value.as_str()),
+                None => cmd.env_remove(var),
+            };
+        }
         cmd.args(["_boot-vm", &config_path.to_string_lossy()])
+            .env_remove("SMOLVM_INTERCEPTOR_TOKEN")
             .env(
                 "SMOLVM_BOOT_WATCH_PARENT",
                 if watch_parent { "1" } else { "0" },
@@ -2676,6 +2789,14 @@ impl AgentManager {
         };
 
         if needs_restart {
+            if let Some(name) = self.name() {
+                if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+                    reject_missing_external_interceptor(
+                        &record,
+                        features.external_interceptor.as_ref(),
+                    )?;
+                }
+            }
             tracing::info!("restarting agent VM due to configuration change");
             self.stop()?;
         } else {
@@ -2717,28 +2838,46 @@ impl AgentManager {
 
     /// Returns `Ok(())` if the process is confirmed dead, `Err` if still alive
     /// or identity could not be verified.
-    fn stop_vm_process(&self, pid: crate::process::Pid, start_time: Option<u64>) -> Result<()> {
-        // Use short timeout — the agent may already be gone (ephemeral run exited).
-        // A 100ms connect timeout avoids blocking the exit path.
-        let connect_started = Instant::now();
-        let connection = super::AgentClient::connect_with_short_timeout(&self.vsock_socket);
-        tracing::debug!(
-            pid,
-            connect_ms = connect_started.elapsed().as_millis(),
-            connected = connection.is_ok(),
-            "shutdown agent connect finished"
-        );
-        let shutdown = connection.and_then(|mut client| client.shutdown());
-        let shutdown_acked = shutdown.is_ok();
+    fn stop_vm_process(
+        &self,
+        pid: crate::process::Pid,
+        start_time: Option<u64>,
+        guest_is_paused: bool,
+    ) -> Result<()> {
+        // A paused guest has no vCPU to service the request and nothing left to
+        // flush, so skip the handshake rather than wait out its deadline and
+        // then refuse the stop. Identity is still verified below, from the PID
+        // start time or this VM's own boot-config path.
+        let shutdown_acked = if guest_is_paused {
+            tracing::debug!(
+                pid,
+                "guest is paused; terminating without a shutdown handshake"
+            );
+            false
+        } else {
+            // Use short timeout — the agent may already be gone (ephemeral run exited).
+            // A 100ms connect timeout avoids blocking the exit path.
+            let connect_started = Instant::now();
+            let connection = super::AgentClient::connect_with_short_timeout(&self.vsock_socket);
+            tracing::debug!(
+                pid,
+                connect_ms = connect_started.elapsed().as_millis(),
+                connected = connection.is_ok(),
+                "shutdown agent connect finished"
+            );
+            let shutdown = connection.and_then(|mut client| client.shutdown());
+            let acked = shutdown.is_ok();
 
-        // Process identity is not proof that guest writes reached disk. A slow
-        // flush must not turn a graceful stop into an unannounced power cut.
-        if !shutdown_acked && process::is_alive(pid) {
-            return Err(Error::agent(
-                "stop agent",
-                format!("guest did not confirm filesystem synchronization; left the VM alive for retry: {}", shutdown.unwrap_err()),
-            ));
-        }
+            // Process identity is not proof that guest writes reached disk. A slow
+            // flush must not turn a graceful stop into an unannounced power cut.
+            if !acked && process::is_alive(pid) {
+                return Err(Error::agent(
+                    "stop agent",
+                    format!("guest did not confirm filesystem synchronization; left the VM alive for retry: {}", shutdown.unwrap_err()),
+                ));
+            }
+            acked
+        };
 
         // Identity check: vsock acknowledgement OR strict PID start-time match OR
         // an argv match on this VM's unique boot-config path. We intentionally do
@@ -2951,6 +3090,23 @@ impl AgentManager {
 
     /// Stop the agent VM.
     pub fn stop(&self) -> Result<()> {
+        self.stop_inner(false)
+    }
+
+    /// Stop a machine whose guest is paused and already quiesced.
+    ///
+    /// A frozen fork base is snapshot-paused: its vCPUs are not running, so its
+    /// agent cannot answer a shutdown request no matter how long we wait, and
+    /// the checkpoint that froze it already quiesced its filesystems. The
+    /// graceful path exists to guarantee an fsync acknowledgement before the
+    /// process dies; here that guarantee is already met, so asking for it only
+    /// burns the deadline and then refuses to stop a machine that is safe to
+    /// terminate — leaving it running, and billing, with no way out but delete.
+    pub fn stop_paused(&self) -> Result<()> {
+        self.stop_inner(true)
+    }
+
+    fn stop_inner(&self, guest_is_paused: bool) -> Result<()> {
         let state = {
             let inner = self.inner.lock();
             inner.state
@@ -2960,7 +3116,7 @@ impl AgentManager {
             // Even if internal state is Stopped, check PID file for orphan processes
             // from previous CLI invocations that weren't properly cleaned up.
             if let Some((pid, start_time)) = self.read_pid_file_with_start_time() {
-                if let Err(e) = self.stop_vm_process(pid, start_time) {
+                if let Err(e) = self.stop_vm_process(pid, start_time, guest_is_paused) {
                     tracing::warn!(
                         pid,
                         "orphan process still alive, preserving PID/socket files"
@@ -2999,7 +3155,7 @@ impl AgentManager {
         };
 
         if let Some(pid) = child_pid {
-            if let Err(e) = self.stop_vm_process(pid, pid_start_time) {
+            if let Err(e) = self.stop_vm_process(pid, pid_start_time, guest_is_paused) {
                 // Revert to Running — don't lie about state or delete markers
                 {
                     let mut inner = self.inner.lock();
@@ -3471,6 +3627,69 @@ fn boot_failure_reason(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn intercepted_machine_cannot_relaunch_without_an_interceptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&temp.path().join("smolvm.db")).unwrap();
+        let record = crate::config::VmRecord::new("worker".into(), 1, 512, vec![], vec![], true);
+        db.insert_vm("worker", &record).unwrap();
+
+        // Existing records and ordinary machines remain bootable.
+        enforce_external_interceptor_requirement(&db, "worker", None).unwrap();
+        let endpoint = smolvm_protocol::InterceptEndpoint {
+            addr: "127.0.0.1:43123".parse().unwrap(),
+            token: [7; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        enforce_external_interceptor_requirement(&db, "worker", Some(&endpoint)).unwrap();
+        assert!(
+            db.get_vm("worker")
+                .unwrap()
+                .unwrap()
+                .external_interceptor_required
+        );
+
+        let error = enforce_external_interceptor_requirement(&db, "worker", None).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires an external interceptor"));
+        enforce_external_interceptor_requirement(&db, "worker", Some(&endpoint)).unwrap();
+    }
+
+    /// A frozen fork base is snapshot-paused, so no shutdown acknowledgement is
+    /// ever coming. Waiting for one and then refusing to stop is how such a
+    /// machine became unstoppable: `exec` and `start` both told the caller to
+    /// stop it, and `stop` was the one thing that could not work.
+    #[cfg(unix)]
+    #[test]
+    fn a_paused_guest_is_terminated_without_waiting_for_an_acknowledgement() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StorageDisk::open_or_create_at(&temp.path().join("storage.raw"), 1).unwrap();
+        let overlay = OverlayDisk::open_or_create_at(&temp.path().join("overlay.raw"), 1).unwrap();
+        let mut manager = AgentManager::new(temp.path().join("rootfs"), storage, overlay).unwrap();
+        // No agent listening, exactly as for a paused guest.
+        manager.vsock_socket = temp.path().join("missing-agent.sock");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as crate::process::Pid;
+
+        let started = std::time::Instant::now();
+        let result = manager.stop_vm_process(pid, process::process_start_time(pid), true);
+        let elapsed = started.elapsed();
+        let survived = matches!(child.try_wait(), Ok(None));
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(result.is_ok(), "a paused guest must stop: {result:?}");
+        assert!(!survived, "the paused VM's process must be gone");
+        // The handshake was skipped, not merely fast: its own deadline is 5s.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}, so the shutdown handshake was still attempted"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn graceful_stop_keeps_live_process_when_guest_does_not_acknowledge() {
@@ -3484,7 +3703,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id() as crate::process::Pid;
-        let result = manager.stop_vm_process(pid, process::process_start_time(pid));
+        let result = manager.stop_vm_process(pid, process::process_start_time(pid), false);
         let survived = matches!(child.try_wait(), Ok(None));
         let _ = child.kill();
         let _ = child.wait();

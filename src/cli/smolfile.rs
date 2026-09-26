@@ -125,6 +125,7 @@ pub fn build_create_params(
                 || cli_dns.is_some()
                 || cli_network_name.is_some();
             return Ok(CreateVmParams {
+                disks: Vec::new(),
                 secret_refs: Default::default(),
                 name,
                 labels: cli_labels,
@@ -140,6 +141,7 @@ pub fn build_create_params(
                 network_backend: cli_network_backend,
                 dns: cli_dns,
                 network_name: cli_network_name,
+                guest_subnet: None,
                 init: cli_init,
                 env: cli_env,
                 workdir: cli_workdir,
@@ -167,6 +169,8 @@ pub fn build_create_params(
                 gpu_vram_mib: None,
                 rosetta: false,
                 dns_filter_hosts: None,
+                credential_policy: None,
+                credential_placeholders: Default::default(),
                 published_sockets: Vec::new(),
                 source_smolmachine: None,
             });
@@ -311,7 +315,11 @@ pub fn build_create_params(
     allowed_cidrs_vec.extend(cli_allow_cidr);
 
     // --allow-cidr / --allow-host / [network] / --dns implies --net
-    let net = if !allowed_cidrs_vec.is_empty() || !sf_allow_hosts.is_empty() || cli_dns.is_some() {
+    let net = if !allowed_cidrs_vec.is_empty()
+        || !sf_allow_hosts.is_empty()
+        || !network.credentials.is_empty()
+        || cli_dns.is_some()
+    {
         true
     } else {
         net
@@ -359,6 +367,7 @@ pub fn build_create_params(
         .and_then(|s| parse_duration_secs(s));
 
     Ok(CreateVmParams {
+        disks: Vec::new(),
         nested_virt: false,
         labels: cli_labels,
         secret_refs: sf.secrets,
@@ -375,6 +384,7 @@ pub fn build_create_params(
         network_backend,
         dns: cli_dns,
         network_name: cli_network_name,
+        guest_subnet: None,
         init,
         env,
         workdir,
@@ -405,6 +415,12 @@ pub fn build_create_params(
         } else {
             Some(sf_allow_hosts)
         },
+        credential_policy: (!network.credentials.is_empty()).then_some(
+            smolvm::credentials::CredentialPolicy {
+                credentials: network.credentials,
+            },
+        ),
+        credential_placeholders: Default::default(),
         published_sockets: Vec::new(),
         source_smolmachine: None,
     })
@@ -538,10 +554,9 @@ pub fn resolve_pack_config(
         // matching the same logic in build_create_params().
         // Preserve the tri-state: None = unspecified, Some = explicit.
         net: {
-            let network_section_implies_net = sf
-                .network
-                .as_ref()
-                .is_some_and(|n| !n.allow_hosts.is_empty() || !n.allow_cidrs.is_empty());
+            let network_section_implies_net = sf.network.as_ref().is_some_and(|n| {
+                !n.allow_hosts.is_empty() || !n.allow_cidrs.is_empty() || !n.credentials.is_empty()
+            });
             if network_section_implies_net {
                 Some(true)
             } else {
@@ -685,7 +700,8 @@ init = ["echo init"]
         // setting the command line leaves out, and the command line wins for
         // each one it gives.
         use crate::cli::pack_run::resolve_packed_launch;
-        let launch = resolve_packed_launch(&manifest, &[], &[], None, None).unwrap();
+        let no_secrets = std::collections::BTreeMap::new();
+        let launch = resolve_packed_launch(&manifest, &[], &[], &no_secrets, None, None).unwrap();
         assert_eq!(launch.command, vec!["/bin/sh", "-c", "sleep infinity"]);
         assert!(launch
             .env
@@ -696,6 +712,7 @@ init = ["echo init"]
             &manifest,
             &["id".to_string()],
             &["GREETING=bye".to_string()],
+            &no_secrets,
             Some("/tmp".to_string()),
             Some("0".to_string()),
         )

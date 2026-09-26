@@ -17,6 +17,7 @@ use smolvm::secrets::SecretRef;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use smolvm_protocol::ImageInfo;
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::io::Write;
 
 // ============================================================================
@@ -470,6 +471,8 @@ pub struct CreateVmParams {
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
     pub network_name: Option<String>,
+    /// Canonical `--guest-subnet` CIDR, when set.
+    pub guest_subnet: Option<String>,
     pub init: Vec<String>,
     pub env: Vec<String>,
     pub workdir: Option<String>,
@@ -478,6 +481,8 @@ pub struct CreateVmParams {
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
     pub block_io: smolvm::data::resources::BlockIoEngine,
+    /// Host disks attached beyond storage and overlay (`--disk`).
+    pub disks: Vec<smolvm::data::disk::AttachedDisk>,
     pub allowed_cidrs: Option<Vec<String>>,
     pub restart_policy: Option<smolvm::config::RestartPolicy>,
     pub restart_max_retries: Option<u32>,
@@ -508,6 +513,12 @@ pub struct CreateVmParams {
     pub rosetta: bool,
     /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// Credential bindings (from `--credential` / `[[network.credentials]]`).
+    pub credential_policy: Option<smolvm::credentials::CredentialPolicy>,
+    /// Placeholders already minted for `credential_policy`. Empty until the
+    /// record is built, except on the ephemeral `run` path, which mints them
+    /// before boot so the launch and the record agree.
+    pub credential_placeholders: BTreeMap<String, String>,
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
     pub published_sockets: Vec<smolvm::config::PublishedSocketConfig>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
@@ -538,13 +549,48 @@ pub fn resolve_secret_refs_for_env(
 /// touches the record or the DB.
 pub fn record_env_with_secrets(record: &VmRecord) -> smolvm::Result<Vec<(String, String)>> {
     let mut env = record.env.clone();
+    // A variable bound to a credential never carries plaintext into the guest:
+    // its secret reference feeds the host interceptor and the guest gets the
+    // placeholder instead.
+    let (refs, credential_env) = smolvm::credentials::workload_env(
+        record.credential_policy.as_ref(),
+        &record.credential_placeholders,
+        &record.secret_refs,
+    );
     env.extend(smolvm::secrets::expose_into_env(
         smolvm::secrets::resolve_refs_to_env(
-            &record.secret_refs,
+            &refs,
             smolvm::secrets::ResolutionScope::RecordReplay,
         )?,
     ));
+    env.extend(credential_env);
     Ok(env)
+}
+
+/// The `run` counterpart of [`record_env_with_secrets`]: resolve the create
+/// parameters' secret refs (minus credential-bound ones) and append the
+/// credential placeholders and trust variables. Plaintext, do not log.
+pub fn params_secret_env(params: &CreateVmParams) -> smolvm::Result<Vec<(String, String)>> {
+    let (refs, credential_env) = smolvm::credentials::workload_env(
+        params.credential_policy.as_ref(),
+        &params.credential_placeholders,
+        &params.secret_refs,
+    );
+    let mut env = resolve_secret_refs_for_env(&refs)?;
+    env.extend(credential_env);
+    Ok(env)
+}
+
+/// Validate a `run` machine's credential policy and mint its placeholders
+/// ahead of boot. No-op without a policy.
+pub fn prepare_params_credentials(params: &mut CreateVmParams) -> smolvm::Result<()> {
+    if let Some(policy) = params.credential_policy.as_ref().filter(|p| !p.is_empty()) {
+        if params.credential_placeholders.is_empty() {
+            params.credential_placeholders =
+                smolvm::credentials::prepare_policy(policy, params.dns_filter_hosts.as_deref())?;
+        }
+    }
+    Ok(())
 }
 
 /// Create a named machine configuration (does not start it).
@@ -620,6 +666,16 @@ impl Drop for CreateVmReservation {
 }
 
 pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecord> {
+    build_vm_record_for(params, false)
+}
+
+/// [`build_vm_record`] for a machine that is (`restoring_checkpoint`) or isn't
+/// a live-checkpoint restore. A restore is marked before validation so checks
+/// that only make sense for a fresh boot (an image pull) don't reject it.
+pub(crate) fn build_vm_record_for(
+    params: &CreateVmParams,
+    restoring_checkpoint: bool,
+) -> smolvm::Result<VmRecord> {
     // Validate name before touching the database. The on-disk layout uses
     // a hash-derived directory (see `vm_data_dir`), so the name itself has
     // no impact on socket path length — only character sanity + a generous
@@ -721,10 +777,12 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
     record.block_io = params.block_io;
+    record.disks = params.disks.clone();
     record.allowed_cidrs = params.allowed_cidrs.clone();
     record.network_backend = params.network_backend;
     record.dns = params.dns;
     record.network_name = params.network_name.clone();
+    record.guest_subnet = params.guest_subnet.clone();
     record.gpu = if params.gpu { Some(true) } else { None };
     // Persist nesting the same way: `machine start` rebuilds resources from the
     // record, so a flag that only reaches the create-time launch is silently
@@ -751,9 +809,20 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.cuda_vram_limit_mib = params.cuda_vram_limit_mib;
     record.docker_socket = params.docker_socket;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
+    if let Some(policy) = params.credential_policy.as_ref().filter(|p| !p.is_empty()) {
+        record.credential_placeholders = if params.credential_placeholders.is_empty() {
+            smolvm::credentials::prepare_policy(policy, params.dns_filter_hosts.as_deref())?
+        } else {
+            params.credential_placeholders.clone()
+        };
+        record.credential_policy = Some(policy.clone());
+    }
     record.published_sockets = params.published_sockets.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
     record.labels = params.labels.clone();
+    if restoring_checkpoint {
+        record.host_uid_owner = Some(record.name.clone());
+    }
 
     // A registry image with no network can never be pulled (the guest runs the
     // pull), so refuse here rather than deferring to a `start` that must fail.
@@ -847,9 +916,15 @@ pub struct ForkVmOptions<'a> {
     pub fork_secrets: &'a BTreeMap<String, SecretRef>,
     pub wait_ready: Option<std::time::Duration>,
     pub hold: bool,
+    pub freeze_source: bool,
 }
 
 pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm::Result<()> {
+    let source_policy = if options.freeze_source {
+        smolvm::agent::fork::ForkSourcePolicy::Freeze
+    } else {
+        smolvm::agent::fork::ForkSourcePolicy::PlatformDefault
+    };
     let db = SmolvmDb::open()?;
     let _source_lock = smolvm::agent::fork::lock_fork_source(golden)?;
 
@@ -880,11 +955,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     // Freeze + snapshot the golden, register the clone (CoW disks + DB record).
     // The launch-agnostic mechanics live in the lib (`agent::fork`) so the CLI
     // and the serve API share one implementation.
-    if smolvm::agent::fork::fork_continue_enabled() {
-        eprintln!("Checkpointing '{golden}' while keeping it running...");
-    } else {
-        eprintln!("Freezing source '{golden}' as branch base...");
-    }
+    eprintln!("Preparing branch from '{golden}'...");
     let prep = if options.hold {
         smolvm::agent::fork::prepare_held_fork(
             &db,
@@ -893,6 +964,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
             options.pinned_ports,
             options.fork_env,
             options.fork_secrets,
+            source_policy,
         )?
     } else {
         smolvm::agent::fork::prepare_fork(
@@ -903,6 +975,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
             options.clone_forkable,
             options.fork_env,
             options.fork_secrets,
+            source_policy,
         )?
     };
     for (golden_host, guest, clone_host) in &prep.port_remaps {
@@ -915,6 +988,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
         }
     }
 
+    let prep_source_continues = prep.source_continues;
     let snapshot_dir = prep.snapshot_dir.clone();
     if let Err(error) = boot_prepared_fork(
         &db,
@@ -939,7 +1013,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
             "Branched '{golden}' -> held slot '{clone}'. Release it with \
              `smolvm machine branch-release --name {clone}`."
         );
-    } else if smolvm::agent::fork::fork_continue_enabled() {
+    } else if prep_source_continues {
         eprintln!("Branched '{golden}' -> '{clone}'. Source continues running.");
     } else {
         eprintln!(
@@ -960,6 +1034,7 @@ pub struct ForkBatchOptions<'a> {
     pub wait_ready: Option<std::time::Duration>,
     pub parallel: usize,
     pub hold: bool,
+    pub freeze_source: bool,
     /// Wait this long for each released child to run `smolvm-worker-ready`,
     /// tearing the batch down if one never does.
     pub worker_ready: Option<std::time::Duration>,
@@ -976,8 +1051,14 @@ pub fn fork_vm_batch(
         wait_ready,
         parallel,
         hold,
+        freeze_source,
         worker_ready,
     } = options;
+    let source_policy = if freeze_source {
+        smolvm::agent::fork::ForkSourcePolicy::Freeze
+    } else {
+        smolvm::agent::fork::ForkSourcePolicy::PlatformDefault
+    };
     let db = SmolvmDb::open()?;
     let _source_lock = smolvm::agent::fork::lock_fork_source(golden)?;
 
@@ -1016,18 +1097,12 @@ pub fn fork_vm_batch(
             hold,
         })
         .collect();
-    if smolvm::agent::fork::fork_continue_enabled() {
-        eprintln!(
-            "Checkpointing '{golden}' once for {} clones while keeping it running...",
-            clones.len()
-        );
-    } else {
-        eprintln!(
-            "Freezing source '{golden}' once for {} children...",
-            clones.len()
-        );
-    }
-    let prepared = smolvm::agent::fork::prepare_forks(&db, golden, &specs)?;
+    eprintln!(
+        "Preparing one checkpoint for {} children from '{golden}'...",
+        clones.len()
+    );
+    let prepared = smolvm::agent::fork::prepare_forks(&db, golden, &specs, source_policy)?;
+    let source_continues = prepared[0].source_continues;
     let snapshot_dir = prepared[0].snapshot_dir.clone();
     let all_names: Vec<String> = clones.iter().map(|(name, _)| name.clone()).collect();
     let jobs: Vec<_> = prepared
@@ -1156,6 +1231,11 @@ pub fn fork_vm_batch(
         return retain_failed_fork(golden, &snapshot_dir, error);
     }
 
+    if source_continues {
+        eprintln!("Source '{golden}' continues running.");
+    } else {
+        eprintln!("Source '{golden}' stays frozen as the branch base.");
+    }
     if hold {
         eprintln!(
             "Provisioned {} held branch {} from '{golden}' with one checkpoint.",
@@ -1282,6 +1362,9 @@ fn boot_prepared_fork(
                 defer_running_persistence: retry_gate.is_some(),
                 ..Default::default()
             },
+            // A clone inherits the golden's running workload from the snapshot
+            // (from_snapshot = true already skips relaunch); never provision-only.
+            StartOptions::default(),
         )
     };
     let started = match retry_gate {
@@ -1481,6 +1564,12 @@ pub(crate) fn default_workload_to_image(
     }
 }
 
+#[derive(Default)]
+pub struct StartOptions {
+    pub no_workload: bool,
+    pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+}
+
 /// Start a named machine that has a config record.
 ///
 /// Uses direct DB operations instead of SmolvmConfig::load() to avoid
@@ -1492,9 +1581,10 @@ pub fn start_vm_named(
     no_proxy: Option<&str>,
     from_snapshot: bool,
     fork: ForkLaunch,
+    options: StartOptions,
 ) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
-    start_vm_named_with_db(&db, name, proxy, no_proxy, from_snapshot, fork)
+    start_vm_named_with_db(&db, name, proxy, no_proxy, from_snapshot, fork, options)
 }
 
 fn start_vm_named_with_db(
@@ -1504,8 +1594,13 @@ fn start_vm_named_with_db(
     no_proxy: Option<&str>,
     from_snapshot: bool,
     mut fork: ForkLaunch,
+    options: StartOptions,
 ) -> smolvm::Result<()> {
     use smolvm::Error;
+    let StartOptions {
+        no_workload,
+        external_interceptor,
+    } = options;
 
     // Direct DB lookup — 1 read cycle instead of loading everything
     let mut record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
@@ -1515,6 +1610,21 @@ fn start_vm_named_with_db(
     let restoring_checkpoint =
         smolvm::portable_checkpoint::pending_dir(&smolvm::agent::vm_data_dir(name)).is_some();
     let from_snapshot = from_snapshot || restoring_checkpoint;
+    if let Some(endpoint) = &external_interceptor {
+        smolvm::agent::validate_external_interceptor(
+            endpoint,
+            &record.vm_resources(),
+            record.credential_policy.is_some(),
+            false,
+        )?;
+        if from_snapshot || fork.forkable || record.forkable_on_start() {
+            return Err(Error::config(
+                "egress interceptor",
+                "external interception does not support checkpoint or branch launches",
+            ));
+        }
+    }
+
     // A Smolfile-declared fork base starts forkable without requiring the user
     // to repeat `--forkable`. Older records that persisted a CUDA pool before
     // the explicit field existed get the same behavior, but clones remain
@@ -1529,7 +1639,19 @@ fn start_vm_named_with_db(
     // case where `start` later said "already running" but every
     // `exec` failed.
     match smolvm::agent::state_probe::resolve_state(name, &record) {
+        RecordState::Paused | RecordState::Pausing => {
+            return Err(Error::agent(
+                "start",
+                "machine has saved execution; use resume",
+            ));
+        }
         RecordState::Running => {
+            if external_interceptor.is_some() {
+                return Err(Error::config(
+                    "egress interceptor",
+                    "stop the running machine before binding an interceptor",
+                ));
+            }
             let pid_suffix = format_pid_suffix(record.pid);
             println!("Machine '{}' already running{}", name, pid_suffix);
             return Ok(());
@@ -1566,6 +1688,12 @@ fn start_vm_named_with_db(
         }
     }
 
+    if record.external_interceptor_required && external_interceptor.is_none() {
+        return Err(Error::config(
+            "egress interceptor",
+            "this machine requires an external interceptor on every start; pass --egress-interceptor and set SMOLVM_INTERCEPTOR_TOKEN",
+        ));
+    }
     if let Some(pool_size) = fork.pool_size {
         if !record.cuda {
             return Err(Error::config(
@@ -1660,6 +1788,8 @@ fn start_vm_named_with_db(
         expose_docker: record.docker_socket,
         published_sockets: record.published_sockets.clone(),
         dns_filter_hosts: record.dns_filter_hosts.clone(),
+        credentials: smolvm::credentials::CredentialLaunch::for_record(name, &record),
+        external_interceptor,
         // A fork clone shares its golden's uid; resolve it explicitly so a
         // cold (re)start can open the golden's CoW disk backing behind its
         // 0700 data dir.
@@ -1828,7 +1958,17 @@ fn start_vm_named_with_db(
         // Remote volumes are mounted natively by the agent between the
         // container's create and start, and a mount that never appears
         // fails the start there — so no host-side preflight is needed.
-        if !from_snapshot {
+        if no_workload {
+            // Provision-only start (the `--oci-cache`/init bake): the image is
+            // pulled and init has run, which is all the snapshot needs. Launching
+            // the workload would be wasted work and would require a runnable
+            // command inside the image, which minimal images (scratch, distroless,
+            // `hello-world`) do not have. Boot to the bare agent instead.
+            tracing::info!(
+                machine = name,
+                "provision-only start (--no-workload): image and init are staged; not launching the workload"
+            );
+        } else if !from_snapshot {
             if let Err(e) = smolvm::workload::launch_image_workload(
                 &mut client,
                 name,
@@ -1909,9 +2049,11 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.network_backend = o.network_backend;
     r.dns = o.dns;
     r.network_name = o.network_name.clone();
+    r.guest_subnet = o.guest_subnet.clone();
     r.storage_gb = o.storage_gb;
     r.overlay_gb = o.overlay_gb;
     r.block_io = o.block_io;
+    r.disks = o.disks.clone();
     r.allowed_cidrs = o.allowed_cidrs.clone();
     r.init = o.init.clone();
     r.init_completed = false;
@@ -1926,6 +2068,8 @@ pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     r.cuda = o.cuda;
     r.docker_socket = o.docker_socket;
     r.dns_filter_hosts = o.dns_filter_hosts.clone();
+    r.credential_policy = o.credential_policy.clone();
+    r.credential_placeholders = o.credential_placeholders.clone();
     r.gpu = if o.gpu { Some(true) } else { None };
     r.gpu_vram_mib = o.gpu_vram_mib;
     r.rosetta = if o.rosetta { Some(true) } else { None };
@@ -1979,9 +2123,12 @@ pub struct DefaultVmOverrides {
     pub network_backend: Option<NetworkBackend>,
     pub dns: Option<std::net::Ipv4Addr>,
     pub network_name: Option<String>,
+    pub guest_subnet: Option<String>,
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
     pub block_io: smolvm::data::resources::BlockIoEngine,
+    /// Host disks attached beyond storage and overlay (`--disk`).
+    pub disks: Vec<smolvm::data::disk::AttachedDisk>,
     pub allowed_cidrs: Option<Vec<String>>,
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
@@ -1995,6 +2142,8 @@ pub struct DefaultVmOverrides {
     pub cuda: bool,
     pub docker_socket: bool,
     pub dns_filter_hosts: Option<Vec<String>>,
+    pub credential_policy: Option<smolvm::credentials::CredentialPolicy>,
+    pub credential_placeholders: BTreeMap<String, String>,
     pub gpu: bool,
     pub gpu_vram_mib: Option<u32>,
     pub rosetta: bool,
@@ -2025,9 +2174,11 @@ impl DefaultVmOverrides {
             network_backend: params.network_backend,
             dns: params.dns,
             network_name: params.network_name.clone(),
+            guest_subnet: params.guest_subnet.clone(),
             storage_gb: params.storage_gb,
             overlay_gb: params.overlay_gb,
             block_io: params.block_io,
+            disks: params.disks.clone(),
             allowed_cidrs: params.allowed_cidrs.clone(),
             init: params.init.clone(),
             env: smolvm::util::parse_env_list(&params.env),
@@ -2040,6 +2191,8 @@ impl DefaultVmOverrides {
             cuda: params.cuda,
             docker_socket: params.docker_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
+            credential_policy: params.credential_policy.clone().filter(|p| !p.is_empty()),
+            credential_placeholders: params.credential_placeholders.clone(),
             gpu: params.gpu,
             gpu_vram_mib: params.gpu_vram_mib,
             rosetta: false,
@@ -2201,6 +2354,13 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
         }
     };
 
+    if record.paused_checkpoint.is_some() {
+        return Err(smolvm::Error::agent(
+            "stop",
+            "machine has saved execution; use resume or delete",
+        ));
+    }
+
     // Resolve via the shared probe so an `Unreachable` VM (live PID,
     // dead agent) is correctly stopped instead of skipped with a
     // misleading "not running" message. `cli_recover_if_unreachable`
@@ -2270,13 +2430,22 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
 
     println!("Stopping machine '{}'...", name);
 
+    // A frozen fork base is snapshot-paused: its agent cannot answer, so both
+    // the staged-mount sync and the shutdown handshake would block until their
+    // deadlines and then fail. The checkpoint that froze it already quiesced
+    // its filesystems, which is what the handshake exists to confirm.
+    let frozen = resolved == RecordState::Frozen;
     let manager = AgentManager::for_vm(name)
         .map_err(|e| smolvm::Error::agent("create agent manager", e.to_string()))?;
-    if !record.staged_mounts.is_empty() {
+    if !frozen && !record.staged_mounts.is_empty() {
         let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
         smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
     }
-    manager.stop()?;
+    if frozen {
+        manager.stop_paused()?;
+    } else {
+        manager.stop()?;
+    }
 
     // Detach the machine's case-sensitive layers volume now that its process is
     // gone (macOS hdiutil mount; no-op on Linux). The volume is owned 1:1 by this
@@ -2627,6 +2796,20 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // Confirm deletion unless --force (or --cascade, which is already an
     // explicit "remove this and its clones" and runs unattended).
     if !force && !options.cascade {
+        // Without a terminal there is nobody to answer the prompt: the read
+        // below would see EOF, take it as "no", and return Ok — leaving a
+        // script that believed it had cleaned up with a machine still on disk.
+        // Refuse loudly instead, and name the flag the caller needs.
+        if !std::io::stdin().is_terminal() {
+            return Err(smolvm::Error::agent(
+                "delete",
+                format!(
+                    "machine '{name}' needs confirmation but stdin is not a terminal; \
+                     pass --force to delete it, or --cascade to remove it together with \
+                     any machines branched from it"
+                ),
+            ));
+        }
         eprint!("Delete machine '{}'? [y/N] ", name);
         let mut input = String::new();
         if std::io::stdin().read_line(&mut input).is_ok() {
@@ -2719,12 +2902,7 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
 
 /// Show status of a named or default machine.
 ///
-/// The `extra` callback is invoked when the VM is running, allowing callers
-/// to display additional information (e.g., machine lists containers).
-pub fn status_vm<F>(name: &Option<String>, extra: F) -> smolvm::Result<()>
-where
-    F: FnOnce(&AgentManager),
-{
+pub fn status_vm(name: &Option<String>) -> smolvm::Result<()> {
     let label = vm_label(name);
 
     // A frozen fork base's paused agent never answers; connecting to it
@@ -2737,20 +2915,27 @@ where
             .and_then(|db| db.get_vm(n).ok().flatten())
         {
             if smolvm::agent::state_probe::is_frozen_fork_base(n, &record) {
-                println!("Machine '{}': {}", label, RecordState::Frozen);
-                return Ok(());
+                return write_status_output(&format!(
+                    "Machine '{}': {}\n",
+                    label,
+                    RecordState::Frozen
+                ));
             }
         }
     }
 
     let manager = get_vm_manager(name)?;
+    // Reconnecting records the verified VM PID as a child. Status only observes
+    // it: a later output error or panic must not make Drop stop that VM.
+    manager.detach();
 
-    if manager.try_connect_existing().is_some() {
+    let output = if manager.try_connect_existing().is_some() {
         let pid_suffix = crate::cli::format_pid_suffix(manager.child_pid());
-        println!("Machine '{}': running{}", label, pid_suffix);
-        print_memory_usage(&manager);
-        extra(&manager);
-        manager.detach();
+        let mut output = format!("Machine '{}': running{}\n", label, pid_suffix);
+        if let Some(memory_line) = memory_usage_line(&manager) {
+            output.push_str(&memory_line);
+        }
+        output
     } else if let Some(ref n) = name {
         // Agent not reachable. Report the precise state from the registry
         // (stopped / failed / created / unreachable), consistent with
@@ -2762,16 +2947,65 @@ where
         {
             Some(record) => {
                 let state = smolvm::agent::state_probe::resolve_state(n, &record);
-                println!("Machine '{}': {}", label, state);
+                format!("Machine '{}': {}\n", label, state)
             }
             None => return Err(smolvm::Error::vm_not_found(n)),
         }
     } else {
         // Default/unnamed VM: no record to resolve.
-        println!("Machine '{}': not running", label);
+        format!("Machine '{}': not running\n", label)
+    };
+
+    write_status_output(&output)
+}
+
+/// A closed pipe means the reader has enough status output. It is not a VM
+/// lifecycle event and should not turn an observational command into a panic.
+fn write_status_output(output: &str) -> smolvm::Result<()> {
+    write_status_output_to(&mut std::io::stdout().lock(), output)
+}
+
+fn write_status_output_to(writer: &mut impl Write, output: &str) -> smolvm::Result<()> {
+    match writer.write_all(output.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(smolvm::Error::agent(
+            "write machine status",
+            error.to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod status_output_tests {
+    use super::write_status_output_to;
+    use std::io::{self, Write};
+
+    struct FailingWriter(io::ErrorKind);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(self.0))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
-    Ok(())
+    #[test]
+    fn closed_status_pipe_is_success_but_other_output_errors_are_reported() {
+        let mut output = Vec::new();
+        write_status_output_to(&mut output, "Machine 'x': running\n").unwrap();
+        assert_eq!(output, b"Machine 'x': running\n");
+
+        write_status_output_to(&mut FailingWriter(io::ErrorKind::BrokenPipe), "status\n").unwrap();
+        assert!(write_status_output_to(
+            &mut FailingWriter(io::ErrorKind::PermissionDenied),
+            "status\n"
+        )
+        .is_err());
+    }
 }
 
 /// Print what the machine is actually using, asked of the guest.
@@ -2784,26 +3018,26 @@ where
 ///
 /// Silent when the machine's agent predates the request: a `status` that still
 /// reports state is more useful than one that fails over a detail.
-fn print_memory_usage(manager: &AgentManager) {
+fn memory_usage_line(manager: &AgentManager) -> Option<String> {
     let Ok(mut client) = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())
     else {
-        return;
+        return None;
     };
     let Ok(status) = client.memory_status() else {
-        return;
+        return None;
     };
     if status.total_bytes == 0 {
-        return;
+        return None;
     }
     let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let percent = status.used_bytes() as f64 * 100.0 / status.total_bytes as f64;
-    println!(
-        "  memory: {:.2} GiB of {:.2} GiB used ({:.0}%), {:.2} GiB available",
+    Some(format!(
+        "  memory: {:.2} GiB of {:.2} GiB used ({:.0}%), {:.2} GiB available\n",
         gib(status.used_bytes()),
         gib(status.total_bytes),
         percent,
         gib(status.available_bytes),
-    );
+    ))
 }
 
 /// Build the per-machine JSON object shared by `machine list --json` and
@@ -2835,6 +3069,7 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "storage_gb": record.storage_gb,
         "overlay_gb": record.overlay_gb,
         "block_io": record.block_io,
+        "disks": record.disks,
         "image": record.image,
         "entrypoint": record.entrypoint,
         "cmd": record.cmd,
@@ -2884,8 +3119,7 @@ pub fn status_vm_json(name: &Option<String>) -> smolvm::Result<()> {
     };
     let json = serde_json::to_string_pretty(&obj)
         .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
-    println!("{}", json);
-    Ok(())
+    write_status_output(&format!("{json}\n"))
 }
 
 // ============================================================================
