@@ -381,7 +381,8 @@ pub struct PackCreateCmd {
     /// Storage disk size in GiB for the temporary pack VM that pulls and
     /// flattens the image. When omitted, the disk is sized from the image's
     /// registry manifest (compressed layer total × headroom, floored at
-    /// [`PACK_VM_MIN_STORAGE_GIB`]); pass this to override the estimate.
+    /// [`PACK_VM_MIN_STORAGE_GIB`], which is also used when the manifest
+    /// can't be probed); pass this to override the estimate.
     #[arg(long, value_name = "GiB")]
     pub storage: Option<u64>,
 
@@ -449,21 +450,21 @@ impl PackCreateCmd {
     /// host-side and the disk is sized at `compressed ×
     /// PACK_VM_STORAGE_FACTOR`, floored at `PACK_VM_MIN_STORAGE_GIB`. The
     /// factor covers gzip's ~3× expansion on extraction plus margin; the floor
-    /// matches the export helper's. A probe failure (offline registry, local
-    /// image source) falls back to `None` — the historical default — so the
-    /// pull itself reports the real error rather than a failed size guess.
-    fn pack_vm_storage_gib(&self, image: &str, oci_platform: Option<&str>) -> Option<u64> {
+    /// matches the export helper's. When the manifest can't be probed (offline
+    /// registry, local image source) the floor is used: the disk is sparse, so
+    /// over-sizing is free, while under-sizing fails the pull mid-way.
+    fn pack_vm_storage_gib(&self, image: &str, oci_platform: Option<&str>) -> u64 {
         if let Some(gib) = self.storage {
-            return Some(gib);
+            return gib;
         }
         if smolvm::data::image_source::is_local_ref(image) {
-            return None;
+            return PACK_VM_MIN_STORAGE_GIB;
         }
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
-                warn!(error = %e, "cannot create runtime for image size probe; using default storage");
-                return None;
+                warn!(error = %e, "cannot create runtime for image size probe; using the storage floor");
+                return PACK_VM_MIN_STORAGE_GIB;
             }
         };
         match rt.block_on(smolvm::image_store::image_compressed_size(
@@ -481,15 +482,15 @@ impl PackCreateCmd {
                     compressed_gib, gib,
                     "sized pack VM storage from image manifest"
                 );
-                Some(gib)
+                gib
             }
             Err(e) => {
                 warn!(
                     image = %image,
                     error = %e,
-                    "image size probe failed; using default pack VM storage"
+                    "image size probe failed; using the pack VM storage floor"
                 );
-                None
+                PACK_VM_MIN_STORAGE_GIB
             }
         }
     }
@@ -669,7 +670,7 @@ impl PackCreateCmd {
         // the disk cannot grow after boot — so the registry manifest (the only
         // pre-pull bound on pull size) sets the floor here.
         let pack_storage_gib =
-            self.pack_vm_storage_gib(&image, pack_config.oci_platform.as_deref());
+            Some(self.pack_vm_storage_gib(&image, pack_config.oci_platform.as_deref()));
         let manager = AgentManager::for_vm_with_sizes(&pack_vm_name, pack_storage_gib, None)?;
         manager.start_with_config(
             Vec::new(),
